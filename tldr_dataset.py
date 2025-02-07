@@ -23,6 +23,27 @@ class TldrDataset:
     def len_val(self):
         return len(self.val)
 
+    def extract_prompt(self, prompt: str):
+        """Process an original prompt from dataset
+
+        The returned token has 4 parts: subreddit, title, POST: <post truncated at start> TL;DR:
+        """
+        post_start, suffix_start = prompt.find('POST:'), prompt.rfind('TL;DR:')
+        assert post_start > -1 and suffix_start > -1
+        prefix = self.tokenizer.encode(prompt[:post_start])  # contains subreddit and title
+        post_prompt = self.tokenizer.encode('POST:')
+        suffix = self.tokenizer.encode('TL;DR:')
+        max_post_length = self.max_prompt_length - len(prefix) - len(post_prompt) - len(suffix)
+        # truncate post content from start if too long
+        post = self.tokenizer.encode(prompt[post_start + len('POST:'): suffix_start])[-max_post_length:]
+        return prefix + post_prompt + post + suffix
+
+    def pad(self, tensors, padding_values, padding_sides):
+        result = []
+        for t, pv, ps in zip(tensors, padding_values, padding_sides):
+            result.append(pad_sequence(t, batch_first=True, padding_value=pv, padding_side=ps))
+        return result
+
 
 class TldrCompletion(TldrDataset):
     """Dataset https://huggingface.co/datasets/trl-lib/tldr
@@ -31,18 +52,6 @@ class TldrCompletion(TldrDataset):
 
     def __init__(self, tokenizer):
         super().__init__('trl-lib/tldr', tokenizer)
-
-    def extract_prompt(self, prompt: str):
-        """Process an original prompt from dataset
-        """
-        post_start, suffix_start = prompt.find('POST:'), prompt.rfind('TL;DR:')
-        assert post_start > -1 and suffix_start > -1
-        prefix = self.tokenizer.encode(prompt[:post_start])  # contains subreddit and title
-        post_prompt = self.tokenizer.encode('POST:')
-        suffix = self.tokenizer.encode('TL;DR:')
-        max_post_length = self.max_prompt_length - len(prefix) - len(post_prompt) - len(suffix)
-        post = self.tokenizer.encode(prompt[post_start + len('POST:'): suffix_start])[-max_post_length:]  # post content, truncate start if too long
-        return prefix + post_prompt + post + suffix  # subreddit, title, POST: <post> TL;DR:
 
     def get_batch(self, idx: torch.Tensor, train: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
         items = self.train[idx] if train else self.val[idx]
@@ -57,11 +66,11 @@ class TldrCompletion(TldrDataset):
             completion_masks.append(torch.ones(len(completion_token)))
 
         # now padding
-        prompts = pad_sequence(prompts, batch_first=True, padding_value=self.tokenizer.eos_token_id, padding_side='left')
-        prompt_masks = pad_sequence(prompt_masks, batch_first=True, padding_value=0, padding_side='left')
-        completions = pad_sequence(completions, batch_first=True, padding_value=self.tokenizer.eos_token_id, padding_side='right')
-        completion_masks = pad_sequence(completion_masks, batch_first=True, padding_value=0, padding_side='right')
-
+        prompts, prompt_masks, completions, completion_masks = self.pad(
+            (prompts, prompt_masks, completions, completion_masks),
+            (self.tokenizer.eos_token_id, 0, self.tokenizer.eos_token_id, 0),
+            ('left', 'left', 'right', 'right')
+        )
         input_ids = torch.cat((prompts, completions), dim=-1)
         mask = torch.cat((prompt_masks, completion_masks), dim=-1)
         return input_ids, mask
@@ -73,8 +82,32 @@ class TldrPreference(TldrDataset):
     def __init__(self, tokenizer):
         super().__init__('trl-lib/tldr-preference', tokenizer)
 
+    def get_batch(self, idx: torch.Tensor, train: bool = True):
+        items = self.train[idx] if train else self.val[idx]
+        chosens, rejects, chosen_masks, reject_masks = [], [], [], []
+
+        for prompt, chosen, rejected in zip(items['prompt'], items['chosen'], items['rejected']):
+            prompt_token = self.extract_prompt(prompt)
+            chosen_token = self.tokenizer.encode(chosen)[:self.max_response_length-1]  # truncate end if too long
+            chosen_token = torch.as_tensor(prompt_token + chosen_token + [self.tokenizer.eos_token_id])
+            chosens.append(chosen_token)
+            reject_token = self.tokenizer.encode(rejected)[:self.max_response_length-1]  # truncate end if too long
+            reject_token = torch.as_tensor(prompt_token + reject_token + [self.tokenizer.eos_token_id])
+            rejects.append(reject_token)
+
+            chosen_masks.append(torch.ones(len(chosen_token)))
+            reject_masks.append(torch.ones(len(reject_token)))
+
+        # concatenate chosens and rejects. first half is chosen, second half reject
+        chosens.extend(rejects)
+        chosen_masks.extend(reject_masks)
+        ids, masks = self.pad(
+            (chosens, chosen_masks),
+            (self.tokenizer.eos_token_id, 0),
+            ('right', 'right')
+        )
+        return ids, masks
 
 
 if __name__ == '__main__':
     pass
-

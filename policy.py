@@ -1,6 +1,10 @@
+import numpy as np
 import torch
+from torch import nn
 from torch.nn import functional as F
 from transformers import GPT2Tokenizer
+
+from gpt2 import GPT2ModelParams, model_param
 
 
 class Policy:
@@ -9,7 +13,7 @@ class Policy:
             lm_model,  # language model
             tokenizer: GPT2Tokenizer,
             config: dict,
-            train: bool,
+            train: bool = True,
             device: int = 0  # index of current device
     ):
         super().__init__()
@@ -66,3 +70,38 @@ class Policy:
         optim_groups = prepare_arguments()
         optimizer = torch.optim.AdamW(optim_groups, learning_rate, betas=(0.9, 0.95))
         return optimizer
+
+
+class Reward(Policy):
+    def __init__(
+            self,
+            lm_model,  # language model
+            tokenizer: GPT2Tokenizer,
+            config: dict,
+            trained_reward: bool = False,  # is the reward model trained
+            device: int = 0  # index of current device
+    ):
+        super().__init__(lm_model, tokenizer, config, not trained_reward, device)
+
+        if not trained_reward:
+            n_embd = model_param[config['model']].n_embd  # dimension of embedding, i.e. hidden_size
+            self.lm_model.lm_head = nn.Linear(n_embd, 1)
+            torch.nn.init.normal_(self.lm_model.lm_head.weight, std=1 / np.sqrt(n_embd + 1))
+
+    def forward(self, input_ids, mask):
+        logits = self.lm_model(input_ids, attention_mask=mask).logits
+        logits = logits.squeeze()[:, -1]  # shape=(batch_size * 2,)
+        rewards = torch.stack(torch.tensor_split(logits, 2)).T  # shape=(batch_size, 2)
+        return rewards
+
+    def loss(self, input_ids, mask):
+        rewards = self.forward(input_ids, mask)
+        labels = torch.zeros(len(input_ids) // 2).to(self.device, dtype=torch.int64)  # shape=(batch_size,)
+        loss = F.cross_entropy(rewards, labels)
+        return loss
+
+    @torch.no_grad()
+    def eval_accuracy(self, input_ids, mask):
+        rewards = self.forward(input_ids, mask)
+        acc = torch.mean(rewards[:, 0] > rewards[:, 1], dtype=torch.float16)
+        return acc

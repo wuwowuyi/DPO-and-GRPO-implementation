@@ -17,6 +17,9 @@ class GPT2ModelParams:
     attn_pdrop: float = 0.0
     resid_pdrop: float = 0.0
 
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
 
 @dataclass
 class GPT2LargeModelParams(GPT2ModelParams):

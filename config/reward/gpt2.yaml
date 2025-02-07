@@ -1,0 +1,16 @@
+
+model: gpt2
+dtype: bfloat16
+
+ckpt: saved_ckpt/best_sft_gpt2.pt
+ckpt_type: sft
+
+beta: 0.1
+label_smoothing: 0.0
+
+
+temperature: 0.7
+batch_size: 16  # to reduce memory footprint
+lr: 0.00001
+min_lr: 0.000001
+epoch: 1
