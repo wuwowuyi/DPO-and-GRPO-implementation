@@ -51,7 +51,7 @@ def train(config: dict):
         }
         dir = Path('saved_ckpt')
         dir.mkdir(exist_ok=True)
-        torch.save(ckpt, dir / 'best_sft.pt')
+        torch.save(ckpt, dir / f"best_sft_{config['model']}.pt")
         print(f'Best SFT model has been saved')
 
     def eval_loss():
@@ -73,7 +73,8 @@ def train(config: dict):
         nonlocal best_eval_loss
         if best_eval_loss is None:
             best_eval_loss = cur_eval_loss
-        elif cur_eval_loss < best_eval_loss:
+        elif cur_eval_loss > best_eval_loss:
+            best_eval_loss = cur_eval_loss
             save_ckpt()
 
     eval_loss()  # initial eval loss
