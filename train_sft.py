@@ -73,7 +73,7 @@ def train(config: dict):
         nonlocal best_eval_loss
         if best_eval_loss is None:
             best_eval_loss = cur_eval_loss
-        elif cur_eval_loss > best_eval_loss:
+        elif cur_eval_loss < best_eval_loss:
             best_eval_loss = cur_eval_loss
             save_ckpt()
 
