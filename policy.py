@@ -39,3 +39,30 @@ class Policy:
         loss = F.cross_entropy(logits.reshape(b * t, -1), label.reshape(-1).long(), reduction='none')
         loss = torch.mean(loss.reshape(b, t) * label_mask)  # ignore loss on the padding tokens
         return loss
+
+    def configure_optimizers(self, learning_rate, weight_decay=1e-2):
+        """
+        Adapted from nanoGPT https://github.com/karpathy/nanoGPT
+        """
+        def prepare_arguments():
+            # start with all of the candidate parameters
+            param_dict = {pn: p for pn, p in self.lm_model.named_parameters()}
+            # filter out those that do not require grad
+            param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+            # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+            # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+            decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+            nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+            optim_groups = [
+                {'params': decay_params, 'weight_decay': weight_decay},
+                {'params': nodecay_params, 'weight_decay': 0.0}
+            ]
+            num_decay_params = sum(p.numel() for p in decay_params)
+            num_nodecay_params = sum(p.numel() for p in nodecay_params)
+            print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+            print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+            return optim_groups
+
+        optim_groups = prepare_arguments()
+        optimizer = torch.optim.AdamW(optim_groups, learning_rate, betas=(0.9, 0.95))
+        return optimizer

@@ -5,12 +5,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import wandb
 import yaml
-from torch import optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 from transformers import GPT2Tokenizer
 
-import wandb
 from gpt2 import get_model
 from policy import Policy
 from tldr_dataset import TldrCompletion
@@ -40,9 +40,19 @@ def train(config: dict):
     policy.lm_model.train()
     policy.lm_model.to(device)
 
-    optimizer = optim.Adam(policy.lm_model.parameters(), lr=config['lr'])
-    # training, and evaluation.
     total, batch_size = len(dataset), config['batch_size']
+    best_eval_loss = None
+    optimizer = policy.configure_optimizers(config['lr'])
+    scheduler = CosineAnnealingLR(optimizer, T_max=total // batch_size, eta_min=config['min_lr'])
+
+    def save_ckpt():
+        ckpt = {
+            'model': policy.lm_model.state_dict()
+        }
+        dir = Path('saved_ckpt')
+        dir.mkdir(exist_ok=True)
+        torch.save(ckpt, dir / 'best_sft.pt')
+        print(f'Best SFT model has been saved')
 
     def eval_loss():
         policy.lm_model.eval()
@@ -55,10 +65,20 @@ def train(config: dict):
             with torch.no_grad():
                 eval_loss = policy.sft_loss(eval_input_ids, eval_mask)
             eval_losses.append(eval_loss.cpu().item())
-        print(f"eval loss is {np.mean(eval_losses):.4f}")
+
+        cur_eval_loss = np.mean(eval_losses)
+        print(f"eval loss is {cur_eval_loss:.4f}")
         policy.lm_model.train()
 
-    eval_loss()
+        nonlocal best_eval_loss
+        if best_eval_loss is None:
+            best_eval_loss = cur_eval_loss
+        elif cur_eval_loss < best_eval_loss:
+            save_ckpt()
+
+    eval_loss()  # initial eval loss
+    loss_interval = 100
+    eval_interval = loss_interval * 5
     for i in range(config['epoch']):
 
         print(f'Start training epoch {i}')
@@ -72,15 +92,17 @@ def train(config: dict):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            scheduler.step()
 
             if config['wandb_log']:
                 wandb.log({
                     "loss": loss,
+                    "lr": scheduler.get_lr()[0]
                 })
-            elif j % 100 == 0:
+            elif j % loss_interval == 0:
                 print(f"training loss is {loss.detach().cpu().item():.4f}")
 
-            if j % 1000 == 0:
+            if j % eval_interval == 0:
                 eval_loss()
     eval_loss()
 
