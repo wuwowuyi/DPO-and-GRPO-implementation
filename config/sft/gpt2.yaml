@@ -1,0 +1,12 @@
+
+model: gpt2
+dtype: bfloat16
+
+beta: 0.1
+label_smoothing: 0.0
+
+
+temperature: 0.7
+batch_size: 32
+lr: 0.00005
+epoch: 1

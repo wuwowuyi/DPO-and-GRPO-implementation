@@ -1,0 +1,116 @@
+import argparse
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+import yaml
+from torch import optim
+from tqdm import tqdm
+from transformers import GPT2Tokenizer
+
+import wandb
+from gpt2 import get_model
+from policy import Policy
+from tldr_dataset import TldrCompletion
+
+'''This script is for testing small models on a single GPU. '''
+
+def train(config: dict):
+
+    seed = 1337 + config['seed']
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    if config['wandb_log']:  # wandb logging
+        wandb_project = 'rejection_sampling'
+        wandb_run_name = str(int(time.time()))
+        wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+
+    device = config['device']
+
+    # prepare data
+    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+    tokenizer.pad_token_id = tokenizer.eos_token_id
+    dataset = TldrCompletion(tokenizer)
+
+    # load model
+    policy = Policy(get_model(config), tokenizer, config, True, device)
+    policy.lm_model.train()
+    policy.lm_model.to(device)
+
+    optimizer = optim.Adam(policy.lm_model.parameters(), lr=config['lr'])
+    # training, and evaluation.
+    total, batch_size = len(dataset), config['batch_size']
+
+    def eval_loss():
+        policy.lm_model.eval()
+        eval_losses = []
+        eval_order = torch.arange(dataset.len_val())
+        for k in range(dataset.len_val() // batch_size):
+            vidx = eval_order[k * batch_size: k * batch_size + batch_size]
+            eval_input_ids, eval_mask = dataset.get_batch(vidx, False)
+            eval_input_ids, eval_mask = eval_input_ids.to(device, dtype=torch.int32), eval_mask.to(device, dtype=torch.int32)
+            with torch.no_grad():
+                eval_loss = policy.sft_loss(eval_input_ids, eval_mask)
+            eval_losses.append(eval_loss.cpu().item())
+        print(f"eval loss is {np.mean(eval_losses):.4f}")
+        policy.lm_model.train()
+
+    eval_loss()
+    for i in range(config['epoch']):
+
+        print(f'Start training epoch {i}')
+        order = torch.randperm(total)
+        for j in tqdm(range(total // batch_size)):
+            idx = order[j * batch_size: j * batch_size + batch_size]
+            input_ids, mask = dataset.get_batch(idx)
+            input_ids, mask = input_ids.to(device, dtype=torch.int32), mask.to(device, dtype=torch.int32)
+
+            loss = policy.sft_loss(input_ids, mask)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            if config['wandb_log']:
+                wandb.log({
+                    "loss": loss,
+                })
+            elif j % 100 == 0:
+                print(f"training loss is {loss.detach().cpu().item():.4f}")
+
+            if j % 1000 == 0:
+                eval_loss()
+    eval_loss()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config_file", "-cfg", type=str, required=True)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--wandb_log", action="store_true")
+    args = parser.parse_args()
+
+    if not Path(args.config_file).is_file():
+        raise ValueError(f"Cannot find configuration file: {args.config_file}")
+    with open(args.config_file, "r") as f:
+        config = yaml.load(f, Loader=yaml.SafeLoader)
+
+    # GPU and communication support
+    support_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported() and torch.cuda.nccl.version() >= (2, 10)
+    if not support_bf16:
+        print("Must install GPUs that support bfloat16.")
+        sys.exit(0)
+    config['device'] = 0  # this script is for single GPU debug
+
+    config['seed'] = args.seed
+    config['wandb_log'] = args.wandb_log
+
+    print(config)
+
+    train(config)
+
+
+if __name__ == '__main__':
+    main()
