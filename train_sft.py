@@ -14,6 +14,7 @@ from transformers import GPT2Tokenizer
 from gpt2 import get_model
 from policy import Policy
 from tldr_dataset import TldrCompletion
+from utils import save_ckpt
 
 '''This script is for testing small models on a single GPU. '''
 
@@ -45,15 +46,6 @@ def train(config: dict):
     optimizer = policy.configure_optimizers(config['lr'])
     scheduler = CosineAnnealingLR(optimizer, T_max=total // batch_size, eta_min=config['min_lr'])
 
-    def save_ckpt():
-        ckpt = {
-            'model': policy.lm_model.state_dict()
-        }
-        dir = Path('saved_ckpt')
-        dir.mkdir(exist_ok=True)
-        torch.save(ckpt, dir / f"best_sft_{config['model']}.pt")
-        print(f'Best SFT model has been saved')
-
     def eval_loss():
         policy.lm_model.eval()
         eval_losses = []
@@ -75,7 +67,7 @@ def train(config: dict):
             best_eval_loss = cur_eval_loss
         elif cur_eval_loss < best_eval_loss:
             best_eval_loss = cur_eval_loss
-            save_ckpt()
+            save_ckpt(policy.lm_model, config['model'])
 
     eval_loss()  # initial eval loss
     loss_interval = 100

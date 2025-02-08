@@ -14,6 +14,7 @@ import wandb
 from gpt2 import get_model
 from policy import Reward
 from tldr_dataset import TldrPreference
+from utils import save_ckpt
 
 '''This script is for testing small models on a single GPU. '''
 
@@ -45,15 +46,6 @@ def train(config: dict):
     optimizer = reward.configure_optimizers(config['lr'])
     scheduler = CosineAnnealingLR(optimizer, T_max=total // batch_size, eta_min=config['min_lr'])
 
-    def save_ckpt():
-        ckpt = {
-            'model': reward.lm_model.state_dict()
-        }
-        dir = Path('saved_ckpt')
-        dir.mkdir(exist_ok=True)
-        torch.save(ckpt, dir / f"best_reward_{config['model']}.pt")
-        print(f'Best SFT model has been saved')
-
     def eval_accuracy():
         reward.lm_model.eval()
         eval_acc = []
@@ -74,7 +66,7 @@ def train(config: dict):
             best_eval_acc = cur_eval_acc
         elif cur_eval_acc > best_eval_acc:
             best_eval_acc = cur_eval_acc
-            save_ckpt()
+            save_ckpt(reward.lm_model, config['model'])
 
     eval_accuracy()  # initial eval loss
     loss_interval = 1  # TODO
