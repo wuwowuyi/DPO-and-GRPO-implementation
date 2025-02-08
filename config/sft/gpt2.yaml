@@ -1,4 +1,4 @@
-
+model_for: sft
 model: gpt2
 dtype: bfloat16
 
@@ -11,3 +11,13 @@ batch_size: 32
 lr: 0.00005
 min_lr: 0.000005
 epoch: 1
+
+
+activation_checkpointing: True
+
+checkpoint_type: FULL_STATE_DICT # SHARDED_STATE_DICT, or FULL_STATE_DICT
+checkpoint_folder: checkpoint
+model_save_name: sft_gpt2
+dist_checkpoint_root_folder: checkpoint
+dist_checkpoint_folder: shard
+save_using_num_threads: 2
