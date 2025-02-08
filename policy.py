@@ -3,8 +3,9 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from transformers import GPT2Tokenizer
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-from gpt2 import GPT2ModelParams, model_param
+from gpt2 import model_param
 
 
 class Policy:
@@ -26,7 +27,7 @@ class Policy:
             for param in self.lm_model.parameters():
                 param.requires_grad_(False)
 
-    def sft_loss(self, input_ids, mask):
+    def loss(self, input_ids, mask):
         """
         Supervised fine-tuning loss.
 
@@ -44,19 +45,24 @@ class Policy:
         loss = torch.mean(loss.reshape(b, t) * label_mask)  # ignore loss on the padding tokens
         return loss
 
-    def configure_optimizers(self, learning_rate, weight_decay=1e-2):
+    def configure_optimizers(self, learning_rate, wrapped=False, weight_decay=1e-2):
         """
         Adapted from nanoGPT https://github.com/karpathy/nanoGPT
         """
         def prepare_arguments():
             # start with all of the candidate parameters
-            param_dict = {pn: p for pn, p in self.lm_model.named_parameters()}
+            module = self.lm_model.module if wrapped else self.lm_model
+            param_dict = {pn: p for pn, p in module.named_parameters()}
             # filter out those that do not require grad
             param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-            # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+            # create optim groups.
             # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-            decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-            nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+            decay_params, nodecay_params = [], []
+            for n, p in param_dict.items():
+                if 'ln_' in n or 'bias' in n:
+                    nodecay_params.append(p)
+                else:
+                    decay_params.append(p)
             optim_groups = [
                 {'params': decay_params, 'weight_decay': weight_decay},
                 {'params': nodecay_params, 'weight_decay': 0.0}
@@ -85,13 +91,19 @@ class Reward(Policy):
 
         if not trained_reward:
             n_embd = model_param[config['model']].n_embd  # dimension of embedding, i.e. hidden_size
-            self.lm_model.lm_head = nn.Linear(n_embd, 1)
-            torch.nn.init.normal_(self.lm_model.lm_head.weight, std=1 / np.sqrt(n_embd + 1))
+            if isinstance(lm_model, FSDP):
+                self.lm_model.module.lm_head = nn.Linear(n_embd, 1)
+                torch.nn.init.normal_(self.lm_model.module.lm_head.weight, std=1 / np.sqrt(n_embd + 1))
+                self.lm_model.module.lm_head.to(device=self.device, dtype=torch.bfloat16)
+            else:
+                self.lm_model.lm_head = nn.Linear(n_embd, 1)
+                torch.nn.init.normal_(self.lm_model.lm_head.weight, std=1 / np.sqrt(n_embd + 1))
+                self.lm_model.lm_head.to(device=self.device, dtype=torch.bfloat16)
 
     def forward(self, input_ids, mask):
         logits = self.lm_model(input_ids, attention_mask=mask).logits
         logits = logits.squeeze()[:, -1]  # shape=(batch_size * 2,)
-        rewards = torch.stack(torch.tensor_split(logits, 2)).T  # shape=(batch_size, 2)
+        rewards = torch.stack(torch.tensor_split(logits, 2)).transpose(0, 1)  # shape=(batch_size, 2)
         return rewards
 
     def loss(self, input_ids, mask):

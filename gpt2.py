@@ -52,7 +52,7 @@ def get_model(config: dict) -> GPT2LMHeadModel:
         if not Path(config['ckpt']).is_file():
             raise ValueError(f"checkpoint does not exist: {config['ckpt']}")
         print(f"Load model {model_type} from checkpoint {config['ckpt']}")
-        ckpt = torch.load(config['ckpt'])
+        ckpt = torch.load(config['ckpt'], weights_only=True)
         model = GPT2LMHeadModel(mcfg)
         model.load_state_dict(ckpt.pop('model'))
     else:

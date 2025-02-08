@@ -17,15 +17,14 @@ from transformers import GPT2Tokenizer
 
 import wandb
 from gpt2 import get_model
-from policy import Policy
-from tldr_dataset import TldrCompletion
+from policy import Policy, Reward
+from tldr_dataset import TldrCompletion, TldrPreference
 from utils import setup, cleanup, check_fn, fsdp_dict, set_seed, save_model_checkpoint
 
 '''Train models on multiple GPUs using FSDP. '''
 
 
 def train(config: dict):
-
     set_seed(config['seed'])
 
     # FSDP environment variables and setup
@@ -38,52 +37,67 @@ def train(config: dict):
 
     if config['wandb_log'] and rank == 0:  # wandb logging
         wandb_project = 'rejection_sampling'
-        wandb_run_name = str(int(time.time()))
+        wandb_run_name = f"{config['model']}-{config['model_for']}-{str(int(time.time()))}"
         wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
-    # prepare data
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
     tokenizer.pad_token_id = tokenizer.eos_token_id
-    dataset = TldrCompletion(tokenizer)
 
     # load model
-    policy = Policy(FSDP(get_model(config), **fsdp_dict, device_id=device),
-                    tokenizer, config, True, device)
+    if config['model_for'] == 'sft':
+        dataset = TldrCompletion(tokenizer)
+        model = Policy(FSDP(get_model(config), **fsdp_dict, device_id=device),
+                        tokenizer, config, True, device)
+    elif config['model_for'] == 'reward':
+        dataset = TldrPreference(tokenizer)
+        model = Reward(FSDP(get_model(config), **fsdp_dict, device_id=device),
+                       tokenizer, config, trained_reward=False, device=device)
+    else:
+        raise ValueError(f"Unknown model usage: {config['model_for']}")
+
     if 'activation_checkpointing' in config and config['activation_checkpointing']:
-        apply_activation_checkpointing(policy.lm_model, check_fn=check_fn)
-    policy.lm_model.train()
+        apply_activation_checkpointing(model.lm_model, check_fn=check_fn)
+    model.lm_model.train()
 
     local_total, local_batch_size = len(dataset) // world_size, config['batch_size'] // world_size
     best_eval_loss = None
-    optimizer = policy.configure_optimizers(config['lr'])
+    optimizer = model.configure_optimizers(config['lr'], wrapped=True)
     scheduler = CosineAnnealingLR(optimizer, T_max=local_total // local_batch_size, eta_min=config['min_lr'])
 
     local_eval_total = dataset.len_val() // world_size
     eval_order = rank * local_eval_total + torch.arange(local_eval_total)
-    def eval_loss():
-        policy.lm_model.eval()
+    def evaluation():
+        model.lm_model.eval()
         eval_losses = []
-        for k in range(local_eval_total // local_batch_size):
+        for k in range(min(50, local_eval_total // local_batch_size)):
             vidx = eval_order[k * local_batch_size: k * local_batch_size + local_batch_size]
             eval_input_ids, eval_mask = dataset.get_batch(vidx, False)
             eval_input_ids, eval_mask = eval_input_ids.to(device, dtype=torch.int32), eval_mask.to(device, dtype=torch.int32)
             with torch.no_grad():
-                eval_loss = policy.sft_loss(eval_input_ids, eval_mask)
+                if config['model_for'] == 'sft':
+                    eval_loss = model.loss(eval_input_ids, eval_mask)
+                elif config['model_for'] == 'reward':
+                    eval_loss = 1 - model.eval_accuracy(eval_input_ids, eval_mask)
             eval_losses.append(eval_loss)
-
-        policy.lm_model.train()
+        model.lm_model.train()
 
         cur_eval_loss = torch.as_tensor(eval_losses, device=device).mean()
+        if config['model_for'] == 'sft':
+            print(f"eval loss is {cur_eval_loss.cpu().item():.4f} on rank {rank}")
+        elif config['model_for'] == 'reward':
+            print(f"eval error rate is {cur_eval_loss.cpu().item():.4f} on rank {rank}")
+
         distributed.all_reduce(cur_eval_loss, op=distributed.ReduceOp.AVG)
-        print(f"eval loss is {cur_eval_loss:.4f}")
         nonlocal best_eval_loss
         if best_eval_loss is None:
             best_eval_loss = cur_eval_loss
         elif cur_eval_loss < best_eval_loss:
             best_eval_loss = cur_eval_loss
-            save_model_checkpoint(policy.lm_model, rank, config)
+            save_model_checkpoint(model.lm_model, rank, config)
+        if rank == 0:
+            wandb.log({'eval': cur_eval_loss})
 
-    eval_loss()  # initial eval loss
+    evaluation()  # initial eval loss
     loss_interval = 50
     eval_interval = loss_interval * 10
     for epoch in range(config['epoch']):
@@ -95,14 +109,14 @@ def train(config: dict):
             input_ids, mask = dataset.get_batch(idx)
             input_ids, mask = input_ids.to(device, dtype=torch.int32), mask.to(device, dtype=torch.int32)
 
-            loss = policy.sft_loss(input_ids, mask)
+            loss = model.loss(input_ids, mask)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             scheduler.step()
 
             if j % eval_interval == 0:
-                eval_loss()
+                evaluation()
 
             fsdp_loss = loss.clone().detach()
             distributed.all_reduce(fsdp_loss, op=distributed.ReduceOp.AVG)
@@ -115,7 +129,7 @@ def train(config: dict):
                 elif j % loss_interval == 0:
                     print(f"training loss is {fsdp_loss.item():.4f}")
         # at epoch end
-        eval_loss()
+        evaluation()
 
     distributed.barrier()
     cleanup()
@@ -141,8 +155,6 @@ def main():
 
     config['seed'] = args.seed
     config['wandb_log'] = args.wandb_log
-
-    print(config)
 
     train(config)
 

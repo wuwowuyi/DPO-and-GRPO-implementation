@@ -32,13 +32,17 @@ class TldrDataset:
         The returned token has 4 parts: subreddit, title, POST: <post truncated at start> TL;DR:
         """
         post_start, suffix_start = prompt.find('POST:'), prompt.rfind('TL;DR:')
-        assert post_start > -1 and suffix_start > -1
-        prefix = self.tokenizer.encode(prompt[:post_start])  # contains subreddit and title
+        if post_start == -1:
+            post_start = 0
+        if suffix_start == -1:
+            suffix_start = len(prompt)
+        prefix = self.tokenizer.encode(prompt[:post_start]) if post_start > 0 else []  # subreddit and title
         post_prompt = self.tokenizer.encode('POST:')
         suffix = self.tokenizer.encode('TL;DR:')
         max_post_length = self.max_prompt_length - len(prefix) - len(post_prompt) - len(suffix)
         # truncate post content from start if too long
-        post = self.tokenizer.encode(prompt[post_start + len('POST:'): suffix_start])[-max_post_length:]
+        start = post_start + len('POST:') if post_start > 0 else 0
+        post = self.tokenizer.encode(prompt[start: suffix_start])[-max_post_length:]  # truncate start
         return prefix + post_prompt + post + suffix
 
     def pad(self, tensors, padding_values, padding_sides):
