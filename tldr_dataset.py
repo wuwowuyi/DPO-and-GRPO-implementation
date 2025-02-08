@@ -23,6 +23,9 @@ class TldrDataset:
     def len_val(self):
         return len(self.val)
 
+    def shuffle(self):
+        self.train.shuffle()
+
     def extract_prompt(self, prompt: str):
         """Process an original prompt from dataset
 
