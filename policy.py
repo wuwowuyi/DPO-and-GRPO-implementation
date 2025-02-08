@@ -101,8 +101,10 @@ class Reward(Policy):
                 self.lm_model.lm_head.to(device=self.device, dtype=torch.bfloat16)
 
     def forward(self, input_ids, mask):
-        logits = self.lm_model(input_ids, attention_mask=mask).logits
-        logits = logits.squeeze()[:, -1]  # shape=(batch_size * 2,)
+        logits = self.lm_model(input_ids, attention_mask=mask).logits  # shape=(batch_size * 2, sequence_length, 1)
+        #logits = logits.squeeze()[:, -1]
+        idx = torch.cumsum(mask, -1).max(-1, keepdim=True).values - 1  # minus 1 because 0-indexed
+        logits = torch.gather(logits.squeeze(), -1, idx.long()).squeeze()  # shape=(batch_size * 2,)
         rewards = torch.stack(torch.tensor_split(logits, 2)).transpose(0, 1)  # shape=(batch_size, 2)
         return rewards
 
