@@ -81,7 +81,7 @@ def train(config: dict):
             input_ids, mask = dataset.get_batch(idx)
             input_ids, mask = input_ids.to(device, dtype=torch.int32), mask.to(device, dtype=torch.int32)
 
-            loss = policy.sft_loss(input_ids, mask)
+            loss = policy.loss(input_ids, mask)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
