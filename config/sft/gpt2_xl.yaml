@@ -1,21 +1,19 @@
-model_for: reward
-model: gpt2
+model_for: sft
+model: gpt2-xl
 dtype: bfloat16
 
-ckpt: saved_ckpt/sft_gpt2_fsdp.pt
-ckpt_type: sft
 
-batch_size: 32  # to reduce memory footprint
-lr: 0.00005
-min_lr: 0.000005
+temperature: 0.7
+batch_size: 32
+lr: 0.000025
+min_lr: 0.0000025
 epoch: 1
 
 activation_checkpointing: True
 
 checkpoint_type: FULL_STATE_DICT # SHARDED_STATE_DICT, or FULL_STATE_DICT
 checkpoint_folder: checkpoint
-model_save_name: reward_gpt2
+model_save_name: sft_gpt2-xl
 dist_checkpoint_root_folder: checkpoint
 dist_checkpoint_folder: shard
-save_using_num_threads: 4
-
+save_using_num_threads: 8
