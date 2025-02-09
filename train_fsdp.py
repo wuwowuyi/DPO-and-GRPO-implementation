@@ -98,8 +98,8 @@ def train(config: dict):
             wandb.log({'eval': cur_eval_loss})
 
     evaluation()  # initial eval loss
-    loss_interval = 50
-    eval_interval = loss_interval * 10
+    loss_interval = 10
+    eval_interval = loss_interval * 50
     for epoch in range(config['epoch']):
         print(f'Start training epoch {epoch}')
         dataset.shuffle()  # shuffle before each epoch
@@ -120,13 +120,13 @@ def train(config: dict):
 
             fsdp_loss = loss.clone().detach()
             distributed.all_reduce(fsdp_loss, op=distributed.ReduceOp.AVG)
-            if rank == 0:
+            if j % loss_interval == 0 and rank == 0:
                 if config['wandb_log']:
                     wandb.log({
                         "loss": fsdp_loss,
                         "lr": scheduler.get_lr()[0]
                     })
-                elif j % loss_interval == 0:
+                else:
                     print(f"training loss is {fsdp_loss.item():.4f}")
         # at epoch end
         evaluation()
