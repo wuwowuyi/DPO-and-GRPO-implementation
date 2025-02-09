@@ -27,7 +27,12 @@ class Policy:
             for param in self.lm_model.parameters():
                 param.requires_grad_(False)
 
-    def loss(self, input_ids, mask):
+    def forward(self, input_ids: torch.Tensor, mask: torch.Tensor):
+        input_token, attention_mask = input_ids[:, :-1].clone(), mask[:, :-1]
+        logits = self.lm_model(input_token, attention_mask=attention_mask).logits  # shape=(batch_size, seq-1, vocab_size)
+        return logits
+
+    def loss(self, input_ids: torch.Tensor, mask: torch.Tensor, **kwargs):
         """
         Supervised fine-tuning loss.
 
@@ -35,14 +40,11 @@ class Policy:
         :param mask: where 0 corresponds the pad token in input_ids
         :return:
         """
-        input_token, attention_mask = input_ids[:, :-1].clone(), mask[:, :-1]
+        logits = self.forward(input_ids, mask)
         label = input_ids[:, 1:]
-        label_mask = torch.ne(mask[:, 1:], 0).to(device=self.device)
-
-        logits = self.lm_model(input_token, attention_mask=attention_mask).logits  # shape=(batch_size, sequence_length-1, vocab_size)
         b, t = label.shape
         loss = F.cross_entropy(logits.reshape(b * t, -1), label.reshape(-1).long(), reduction='none')
-        loss = torch.mean(loss.reshape(b, t) * label_mask)  # ignore loss on the padding tokens
+        loss = torch.mean(loss.reshape(b, t) * mask[:, 1:])  # ignore loss on the padding tokens
         return loss
 
     def configure_optimizers(self, learning_rate, wrapped=False, weight_decay=1e-2):
@@ -108,7 +110,7 @@ class Reward(Policy):
         rewards = torch.stack(torch.tensor_split(logits, 2)).transpose(0, 1)  # shape=(batch_size, 2)
         return rewards
 
-    def loss(self, input_ids, mask):
+    def loss(self, input_ids, mask, **kwargs):
         rewards = self.forward(input_ids, mask)
         labels = torch.zeros(len(input_ids) // 2).to(self.device, dtype=torch.int64)  # shape=(batch_size,)
         loss = F.cross_entropy(rewards, labels)
@@ -119,3 +121,52 @@ class Reward(Policy):
         rewards = self.forward(input_ids, mask)
         acc = torch.mean(rewards[:, 0] > rewards[:, 1], dtype=torch.float16)
         return acc
+
+
+class DPO(Policy):
+
+    def log_prob(self, input_ids, mask):
+        """
+        :param input_ids: shape=(batch_size * 2, seq) where seq = prompt + response
+        :param mask: shape=(batch_size * 2, seq)
+        :return:
+        """
+        logits = self.forward(input_ids, mask)  # shape=(batch_size, seq-1, vocab_size)
+        label = input_ids[:, 1:]  # shape=(batch_size * 2, seq-1)
+        n, response_length = label.shape
+        logp = -F.cross_entropy(logits.reshape(n * response_length, -1), label.reshape(-1).long(), reduction='none')  # shape=(n * response_length,)
+        logp = torch.sum(logp.reshape(n, response_length) * mask[:, 1:], dim=-1)  # ignore logp on the padding tokens
+        return logp
+
+    def loss(self, input_ids, mask, **kwargs):
+        """
+        :param input_ids: shape=(batch_size * 2, seq_length) where seq is prompt + response
+
+        :return: DPO loss
+        """
+        policy_ref = kwargs.pop('policy_ref')
+        with torch.no_grad():
+            logp_ref = policy_ref.log_prob(input_ids, mask)
+
+        logp = self.log_prob(input_ids, mask)
+
+        b = input_ids.shape[0] // 2
+        # win_idx: index of prompt + preferred_response. shape=(batch_size, )
+        # lose_idx: index of prompt + non-preferred_response. shape=(batch_size, )
+        win_idx, lose_idx = torch.arange(b, device=self.device), torch.arange(b, 2 * b, device=self.device)
+        logp_ref_w, logp_ref_l = logp_ref[win_idx], logp_ref[lose_idx]
+        logp_w, logp_l = logp[win_idx], logp[lose_idx]
+        loss_logits = (logp_w - logp_l) - (logp_ref_w - logp_ref_l)
+        beta, label_smoothing = self.config['beta'], self.config['label_smoothing']
+        loss = -F.logsigmoid(beta * loss_logits) * (1 - label_smoothing) - F.logsigmoid(-beta * loss_logits) * label_smoothing
+        return loss.mean()
+
+    @torch.no_grad()
+    def eval_accuracy(self, input_ids, mask):
+        logp = self.log_prob(input_ids, mask)
+        b = input_ids.shape[0] // 2
+        win_idx, lose_idx = torch.arange(b, device=self.device), torch.arange(b, 2 * b, device=self.device)
+        logp_w, logp_l = logp[win_idx], logp[lose_idx]
+        acc = torch.mean(logp_w > logp_l, dtype=torch.float16)
+        return acc
+

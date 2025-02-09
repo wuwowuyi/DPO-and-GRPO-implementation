@@ -17,7 +17,7 @@ from transformers import GPT2Tokenizer
 
 import wandb
 from gpt2 import get_model
-from policy import Policy, Reward
+from policy import Policy, Reward, DPO
 from tldr_dataset import TldrCompletion, TldrPreference
 from utils import setup, cleanup, check_fn, fsdp_dict, set_seed, save_model_checkpoint
 
@@ -52,6 +52,11 @@ def train(config: dict):
         dataset = TldrPreference(tokenizer)
         model = Reward(FSDP(get_model(config), **fsdp_dict, device_id=device),
                        tokenizer, config, trained_reward=False, device=device)
+    elif config['model_for'] == 'dpo':
+        dataset = TldrPreference(tokenizer)
+        policy_ref = DPO(FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, False, device)
+        policy_ref.lm_model.eval()
+        model = DPO(FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, True, device)
     else:
         raise ValueError(f"Unknown model usage: {config['model_for']}")
 
@@ -76,7 +81,7 @@ def train(config: dict):
             with torch.no_grad():
                 if config['model_for'] == 'sft':
                     eval_loss = model.loss(eval_input_ids, eval_mask)
-                elif config['model_for'] == 'reward':
+                elif config['model_for'] == 'reward' or config['model_for'] == 'dpo':
                     eval_loss = 1 - model.eval_accuracy(eval_input_ids, eval_mask)
             eval_losses.append(eval_loss)
         model.lm_model.train()
@@ -84,7 +89,7 @@ def train(config: dict):
         cur_eval_loss = torch.as_tensor(eval_losses, device=device).mean()
         if config['model_for'] == 'sft':
             print(f"eval loss is {cur_eval_loss.cpu().item():.4f} on rank {rank}")
-        elif config['model_for'] == 'reward':
+        elif config['model_for'] == 'reward' or config['model_for'] == 'dpo':
             print(f"eval error rate is {cur_eval_loss.cpu().item():.4f} on rank {rank}")
 
         distributed.all_reduce(cur_eval_loss, op=distributed.ReduceOp.AVG)
@@ -94,10 +99,9 @@ def train(config: dict):
         elif cur_eval_loss < best_eval_loss:
             best_eval_loss = cur_eval_loss
             save_model_checkpoint(model.lm_model, rank, config)
-        if rank == 0:
+        if config['wandb_log'] and rank == 0:
             wandb.log({'eval': cur_eval_loss})
 
-    evaluation()  # initial eval loss
     loss_interval = 10
     eval_interval = loss_interval * 50
     for epoch in range(config['epoch']):
@@ -109,7 +113,10 @@ def train(config: dict):
             input_ids, mask = dataset.get_batch(idx)
             input_ids, mask = input_ids.to(device, dtype=torch.int32), mask.to(device, dtype=torch.int32)
 
-            loss = model.loss(input_ids, mask)
+            if config['model_for'] == 'dpo':
+                loss = model.loss(input_ids, mask, policy_ref=policy_ref)
+            else:
+                loss = model.loss(input_ids, mask)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
