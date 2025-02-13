@@ -9,7 +9,7 @@ Path(dataset_cache).mkdir(parents=True, exist_ok=True)
 
 
 class TldrDataset:
-    def __init__(self, name: str, tokenizer, max_prompt_length: int = 768, max_response_length: int = 256):
+    def __init__(self, name: str, tokenizer, max_prompt_length: int = 512, max_response_length: int = 64):
         self.train = load_dataset(name, split='train', cache_dir=dataset_cache)
         self.val = load_dataset(name, split='validation', cache_dir=dataset_cache)
         self.tokenizer = tokenizer
@@ -60,7 +60,7 @@ class TldrCompletion(TldrDataset):
     def __init__(self, tokenizer):
         super().__init__('trl-lib/tldr', tokenizer)
 
-    def get_batch(self, idx: torch.Tensor, train: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+    def get_batch(self, idx: torch.Tensor, train: bool = True, with_completion: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
         items = self.train[idx] if train else self.val[idx]
         prompts, completions, prompt_masks, completion_masks = [], [], [], []
         for prompt, completion in zip(items['prompt'], items['completion']):
@@ -78,8 +78,11 @@ class TldrCompletion(TldrDataset):
             (self.tokenizer.eos_token_id, 0, self.tokenizer.eos_token_id, 0),
             ('left', 'left', 'right', 'right')
         )
-        input_ids = torch.cat((prompts, completions), dim=-1)
-        mask = torch.cat((prompt_masks, completion_masks), dim=-1)
+        if with_completion:
+            input_ids = torch.cat((prompts, completions), dim=1)
+            mask = torch.cat((prompt_masks, completion_masks), dim=1)
+        else:
+            input_ids, mask = prompts, prompt_masks
         return input_ids, mask
 
 
@@ -111,7 +114,7 @@ class TldrPreference(TldrDataset):
         ids, masks = self.pad(
             (chosens, chosen_masks),
             (self.tokenizer.eos_token_id, 0),
-            ('right', 'right')
+            ('left', 'left')
         )
         return ids, masks
 
