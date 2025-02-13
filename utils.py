@@ -1,4 +1,5 @@
 import functools
+import time
 from pathlib import Path
 
 import numpy as np
@@ -36,8 +37,8 @@ fsdp_dict = {
 }
 
 
-def set_seed(seed: int):
-    seed = 1337 + seed
+def set_seed(seed: int, rank: int):
+    seed = 100003 * rank + seed  # different seed on each rank
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -71,7 +72,7 @@ def save_model_checkpoint(model, rank, cfg):
             'model': model.state_dict()
         }
     if rank == 0:
-        save_name = f"{cfg['model_save_name']}_fsdp.pt"
+        save_name = f"{cfg['model_for']}_{cfg['model']}_fsdp_{str(int(time.time()))}.pt"
         print(f"--> saving model {save_name} ...")
         torch.save(ckpt, model_ckpt_dir / save_name)
 
