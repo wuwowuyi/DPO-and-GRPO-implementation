@@ -1,3 +1,6 @@
+import contextlib
+from operator import itemgetter
+
 import numpy as np
 import torch
 from torch import nn
@@ -8,7 +11,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from gpt2 import model_param
 
 
-class Policy:
+class LLM:
     def __init__(
             self,
             lm_model,  # language model
@@ -27,20 +30,16 @@ class Policy:
             for param in self.lm_model.parameters():
                 param.requires_grad_(False)
 
-    def forward(self, input_ids: torch.Tensor, mask: torch.Tensor):
-        input_token, attention_mask = input_ids[:, :-1].clone(), mask[:, :-1]
-        logits = self.lm_model(input_token, attention_mask=attention_mask).logits  # shape=(batch_size, seq-1, vocab_size)
-        return logits
-
     def loss(self, input_ids: torch.Tensor, mask: torch.Tensor, **kwargs):
         """
         Supervised fine-tuning loss.
 
         :param input_ids: concatenation of prompt + completion token. shape=(batch_size, sequence_length)
-        :param mask: where 0 corresponds the pad token in input_ids
+        :param mask: mask of a padding token should be zero otherwise 1.
         :return:
         """
-        logits = self.forward(input_ids, mask)
+        input_token, attention_mask = input_ids[:, :-1].clone(), mask[:, :-1]
+        logits = self.lm_model(input_token, attention_mask=attention_mask).logits  # shape=(n, seq-1, vocab_size)
         label = input_ids[:, 1:]
         b, t = label.shape
         loss = F.cross_entropy(logits.reshape(b * t, -1), label.reshape(-1).long(), reduction='none')
@@ -80,7 +79,81 @@ class Policy:
         return optimizer
 
 
-class Reward(Policy):
+class Policy(LLM):
+
+    def log_prob(self, input_ids, mask, avg_seq: bool = True, scale: bool = False):
+        """
+        Compute per token(step) log probability.
+
+        :param input_ids: shape=(n, sequence_length)
+        :param mask: shape=(n, sequence_length). mask of a padding token should be zero otherwise 1.
+        :param avg_seq: whether to take an average over the entire sequence
+
+        :return: logp shape=(n,) if average over sequence else shape=(n, sequence_length-1)
+        """
+        input_token, attention_mask = input_ids[:, :-1].clone(), mask[:, :-1]
+        logits = self.lm_model(input_token, attention_mask=attention_mask).logits  # shape=(n, seq-1, vocab_size)
+
+        if scale:  # scaled by temperature
+            logits /= torch.as_tensor(self.config['temperature'], dtype=torch.bfloat16, device=self.device)
+
+        label = input_ids[:, 1:]  # shape=(n, seq-1)
+        n, response_length = label.shape
+        logp = -F.cross_entropy(logits.reshape(n * response_length, -1), label.reshape(-1).long(), reduction='none')  # shape=(n * response_length,)
+        logp = logp.reshape(n, response_length) * mask[:, 1:]  # ignore logp on the padding tokens
+        return torch.sum(logp, dim=-1) if avg_seq else logp
+
+    @torch.no_grad()
+    def generate(self, prompt, mask, n_samples: int =1, max_response_length: int = 64, return_logp: bool = False):
+        """
+        Generate responses given prompt.
+        The generated samples of the same prompt are consecutive in the responses.
+        Let's say n_samples = 8, then
+        responses[:8] are responses to the first prompt, responses[8:16] second prompt, and so on.
+
+        NOTE: prompt padding tokens must be on the left!
+
+        :param prompt: shape=(n, prompt_length)
+        :param mask: shape=(n, prompt_length). mask of a padding token should be zero otherwise 1.
+        :param n_samples: number of responses for each prompt
+        :param max_response_length: max length of generated response
+        :param return_logp: log prob of generated response
+
+        :return: sampled responses and optionally corresponding log probs.
+        """
+        # FSDP generation according to https://github.com/pytorch/pytorch/issues/100069
+        ctx = lambda: (FSDP.summon_full_params(self.lm_model, recurse=False, writeback=False)
+                       if self.config['parallel'] == 'FSDP' else contextlib.nullcontext())
+        with ctx():
+            outputs = self.lm_model.generate(
+                prompt,
+                attention_mask=mask,
+                max_new_tokens=max_response_length,
+                do_sample=True,  # random sampling
+                temperature=self.config['temperature'],
+                pad_token_id=self.tokenizer.pad_token_id,
+                num_return_sequences=n_samples,
+                return_dict_in_generate=True,
+                output_logits=True
+            )
+        _, prompt_length = prompt.shape
+        responses = outputs.sequences[:, prompt_length:]  # shape=(n * n_samples, response_length)
+        logps = None
+        if return_logp:
+            logits = torch.stack(outputs.logits)  # shape=(response_length, n * n_samples, vocab_size)
+            logps = F.log_softmax(logits.transpose(0, 1), dim=-1, dtype=torch.bfloat16)  # shape=(n * n_samples, response_length, vocab_size)
+            logps = torch.gather(logps, -1, responses.unsqueeze(2)).squeeze(2)  # shape=(n * n_samples, response_length)
+        return responses.to(dtype=torch.int32, device=self.device), logps.to(device=self.device) if logps else logps
+
+
+class Reward(LLM):
+    """
+    For all methods, if input_ids are preference pairs, first half are prompt + chosen, self half prompt + rejected.
+    All padding tokens of a prompt are on the LEFT side!
+
+    input_ids.shape=(n, sequence_length)
+    mask.shape=(n, sequence_length). mask of a padding token should be zero otherwise 1.
+    """
     def __init__(
             self,
             lm_model,  # language model
@@ -94,65 +167,70 @@ class Reward(Policy):
         if not trained_reward:
             n_embd = model_param[config['model']].n_embd  # dimension of embedding, i.e. hidden_size
             if isinstance(lm_model, FSDP):
-                self.lm_model.module.lm_head = nn.Linear(n_embd, 1)
+                self.lm_model.module.lm_head = nn.Linear(n_embd, 1, bias=False, device=self.device, dtype=torch.bfloat16)
                 torch.nn.init.normal_(self.lm_model.module.lm_head.weight, std=1 / np.sqrt(n_embd + 1))
-                self.lm_model.module.lm_head.to(device=self.device, dtype=torch.bfloat16)
             else:
-                self.lm_model.lm_head = nn.Linear(n_embd, 1)
+                self.lm_model.lm_head = nn.Linear(n_embd, 1, bias=False, device=self.device, dtype=torch.bfloat16)
                 torch.nn.init.normal_(self.lm_model.lm_head.weight, std=1 / np.sqrt(n_embd + 1))
-                self.lm_model.lm_head.to(device=self.device, dtype=torch.bfloat16)
 
-    def forward(self, input_ids, mask):
-        logits = self.lm_model(input_ids, attention_mask=mask).logits  # shape=(batch_size * 2, sequence_length, 1)
-        #logits = logits.squeeze()[:, -1]
-        idx = torch.cumsum(mask, -1).max(-1, keepdim=True).values - 1  # minus 1 because 0-indexed
-        logits = torch.gather(logits.squeeze(), -1, idx.long()).squeeze()  # shape=(batch_size * 2,)
-        rewards = torch.stack(torch.tensor_split(logits, 2)).transpose(0, 1)  # shape=(batch_size, 2)
-        return rewards
+        # todo: normalization
+
+    def compute_reward(self, input_ids, mask, padding_side='left'):
+        logits = self.lm_model(input_ids, attention_mask=mask).logits.squeeze(2)  # shape=(n, sequence_length)
+        if padding_side == 'left':
+            logits = logits[:, -1]  # all padding tokens are on the left
+        elif padding_side == 'right' or padding_side == 'both':
+            idx = torch.cumsum(mask, -1).max(-1, keepdim=True).values - 1  # minus 1 because 0-indexed
+            logits = torch.gather(logits, -1, idx.long()).squeeze()  # shape=(n,)
+        else:
+            raise ValueError("padding_side value should be left, right or both")
+        return logits
 
     def loss(self, input_ids, mask, **kwargs):
-        rewards = self.forward(input_ids, mask)
-        labels = torch.zeros(len(input_ids) // 2).to(self.device, dtype=torch.int64)  # shape=(batch_size,)
+        rewards = self.compute_reward(input_ids, mask)  # shape=(n, )
+        rewards = torch.stack(torch.tensor_split(rewards, 2)).transpose(0, 1)  # shape=(n//2, 2)
+        labels = torch.zeros(len(input_ids) // 2).to(self.device, dtype=torch.int64)  # first half chosen
         loss = F.cross_entropy(rewards, labels)
         return loss
 
     @torch.no_grad()
     def eval_accuracy(self, input_ids, mask):
-        rewards = self.forward(input_ids, mask)
+        rewards = self.compute_reward(input_ids, mask)  # shape=(n, )
+        rewards = torch.stack(torch.tensor_split(rewards, 2)).transpose(0, 1)  # shape=(n//2, 2)
         acc = torch.mean(rewards[:, 0] > rewards[:, 1], dtype=torch.float16)
         return acc
 
 
 class DPO(Policy):
+    """
+    For all methods, if input_ids are preference pairs, first half are prompt + chosen, self half prompt + rejected.
+    All padding tokens of a prompt are on the LEFT side!
 
-    def log_prob(self, input_ids, mask):
-        """
-        :param input_ids: shape=(batch_size * 2, seq) where seq = prompt + response
-        :param mask: shape=(batch_size * 2, seq)
-        :return:
-        """
-        logits = self.forward(input_ids, mask)  # shape=(batch_size, seq-1, vocab_size)
-        label = input_ids[:, 1:]  # shape=(batch_size * 2, seq-1)
-        n, response_length = label.shape
-        logp = -F.cross_entropy(logits.reshape(n * response_length, -1), label.reshape(-1).long(), reduction='none')  # shape=(n * response_length,)
-        logp = torch.sum(logp.reshape(n, response_length) * mask[:, 1:], dim=-1)  # ignore logp on the padding tokens
-        return logp
+    input_ids.shape=(n, sequence_length)
+    mask.shape=(n, sequence_length). mask of a padding token should be zero otherwise 1.
+    """
+
+    def __init__(
+            self,
+            policy_ref: Policy,
+            lm_model,  # language model
+            tokenizer: GPT2Tokenizer,
+            config: dict,
+            train: bool = True,
+            device: int = 0  # index of current device
+    ):
+        super().__init__(lm_model, tokenizer, config, train, device)
+        self.policy_ref = policy_ref
 
     def loss(self, input_ids, mask, **kwargs):
-        """
-        :param input_ids: shape=(batch_size * 2, seq_length) where seq is prompt + response
-
-        :return: DPO loss
-        """
-        policy_ref = kwargs.pop('policy_ref')
         with torch.no_grad():
-            logp_ref = policy_ref.log_prob(input_ids, mask)
+            logp_ref = self.policy_ref.log_prob(input_ids, mask)
 
         logp = self.log_prob(input_ids, mask)
 
         b = input_ids.shape[0] // 2
-        # win_idx: index of prompt + preferred_response. shape=(batch_size, )
-        # lose_idx: index of prompt + non-preferred_response. shape=(batch_size, )
+        # win_idx: index of prompt + chosen response.
+        # lose_idx: index of prompt + rejected response.
         win_idx, lose_idx = torch.arange(b, device=self.device), torch.arange(b, 2 * b, device=self.device)
         logp_ref_w, logp_ref_l = logp_ref[win_idx], logp_ref[lose_idx]
         logp_w, logp_l = logp[win_idx], logp[lose_idx]
@@ -169,4 +247,133 @@ class DPO(Policy):
         logp_w, logp_l = logp[win_idx], logp[lose_idx]
         acc = torch.mean(logp_w > logp_l, dtype=torch.float16)
         return acc
+
+
+class RejectionSampling:
+    """
+    Rejection sampling. see paper https://arxiv.org/abs/2309.06657.
+    """
+    def _post_process(self, responses):
+        """applied to responses before computing a reward.
+        Set all tokens after the truncate token to padding token.
+
+        responses.shape=(n, response_length)
+        """
+        masks = []
+        for t in self.truncate_tokens:
+            masks.append(torch.eq(responses, t).int())  # like 0, 0, ..., 1, 0, ...0, 1, 0,..
+        mask = torch.maximum(*masks)  # set any truncate token match to 1
+        mask = torch.cumsum(mask, dim=1) - mask  # all 0 before and at the first truncate token, all 1 after.
+        processed = torch.where(mask.bool(), self.tokenizer.pad_token_id, responses)
+        processed_mask = torch.eq(mask, 0)
+        return processed, processed_mask
+
+    def _filter_response(self, responses):
+        masks = []
+        for t in self.truncate_tokens:
+            masks.append(torch.eq(responses, t).int())  # like 0, 0, ..., 1, 0, ...0, 1, 0,..
+        mask = torch.maximum(*masks)
+        return torch.any(mask, dim=1)
+
+    @torch.no_grad()
+    def compute_rewards(self, reward_model: Reward, prompt, mask, responses, n_samples: int, penalty_reward_value: float):
+        # post process responses
+        processed, processed_mask = self._post_process(responses)
+        # call reward_model to compute rewards
+        reward_input = torch.cat((prompt, processed), dim=1)  # prompt left padded, response right padded.
+        reward_mask = torch.cat((mask, processed_mask), dim=1)
+        raw_rewards = reward_model.compute_reward(reward_input, reward_mask, padding_side='both')  # shape=(n * n_samples,)
+        # normalize rewards per group
+        rewards = torch.stack(torch.split(raw_rewards, n_samples))  # shape=(n, n_samples)
+        group_mean, group_std = rewards.mean(dim=1, keepdim=True), rewards.std(dim=1, keepdim=True)
+        rewards = ((rewards - group_mean) / group_std).reshape(-1)  # shape=(n * n_samples,)
+        # penalize reward
+        valid_mask = self._filter_response(responses)  # shape=(n * n_samples,)
+        rewards = torch.where(valid_mask, rewards, penalty_reward_value)  # shape=(n * n_samples,)
+        return rewards
+
+    def rejection_sampling(self, responses, rewards, num_samples, beta):
+        """
+        Algorithm 1 (conduct_rejection_sampling function) from paper https://arxiv.org/abs/2309.06657.
+
+        responses: responses to a prompt
+        rewards: rewards of these responses, in the same order as responses
+        num_samples: number to select
+        beta: beta parameter in KL-constrained reward maximization objective
+
+        return accepted samples, sorted by reward in descending order
+        """
+        candidates = {c: r for c, r in zip(torch.unbind(responses), torch.unbind(rewards))}
+        accepted = []
+        while len(accepted) < num_samples:
+            max_reward = max(candidates.values())
+            to_remove = []
+            for c, r in candidates.items():
+                u = torch.rand(1, dtype=torch.bfloat16, device=self.device)
+                if u >= torch.exp((r - max_reward) / beta):  # todo: range of right side value?
+                    continue
+                accepted.append((c, r))
+                to_remove.append(c)
+                if len(accepted) == num_samples:
+                    break
+            for c in to_remove:
+                candidates.pop(c)
+
+        accepted.sort(key=itemgetter(1), reverse=True)  # sort by reward in descending order
+        return [t for t, r in accepted]
+
+
+class RejectionSamplingDPO(DPO, RejectionSampling):
+    """
+    Rejection sampling + DPO.
+    Specifically, use rejection sampling to generate preference pairs to train DPO.
+    see paper https://arxiv.org/abs/2309.06657.
+    """
+    def __init__(
+            self,
+            reward_model: Reward,  # compute rewards for generated samples
+            policy_ref: Policy,  # to generate samples as proposal distribution
+            lm_model,  # language model
+            tokenizer: GPT2Tokenizer,
+            config: dict,
+            train: bool = True,
+            device: int = 0  # index of current device
+    ):
+        super().__init__(policy_ref, lm_model, tokenizer, config, train, device)
+        self.reward_model = reward_model
+        self.truncate_tokens = [198, self.tokenizer.eos_token_id]  # GPT2 tokenizer.encode('\n') = 198
+
+    @torch.no_grad()
+    def generate_pairs(self, prompt, mask):
+        n_samples, max_response_length = self.config['n_samples'], self.config['max_response_length']
+        n, prompt_length = prompt.shape
+
+        # first generate samples using the proposal policy
+        responses, _ = self.policy_ref.generate(prompt, mask, n_samples, max_response_length)
+
+        # second, compute rewards of the generated samples
+        input_ids = prompt.tile((1, n_samples)).reshape(n * n_samples, -1)  # shape=(n * n_samples, prompt_length)
+        tiled_mask = mask.tile((1, n_samples)).reshape(n * n_samples, -1)
+        rewards = self.compute_rewards(self.reward_model, input_ids, tiled_mask,
+                                       responses, n_samples, self.config['penalty_reward_value'])
+
+        # third, construct pairs for DPO
+        seq = torch.cat((input_ids, responses), dim=1)
+        t_groups, r_groups = torch.split(seq, n_samples), torch.split(rewards, n_samples)
+        chosen, rejected = [], []
+        n_select, k = self.config['select_samples'], self.config['select_samples'] // 2
+        for t, r in zip(t_groups, r_groups):
+            samples = self.rejection_sampling(t, r, n_select, self.config['sampling_beta'])
+            chosen.extend(samples[:k])
+            rejected.extend(samples[k:])
+
+        input_ids = torch.cat((torch.stack(chosen), torch.stack(rejected)))  # (n * n_select, prompt_length + response_length)
+        tiled_mask = mask.tile((1, k)).reshape(n * k, -1)
+        tiled_mask = torch.cat((tiled_mask, tiled_mask))
+        response_mask = torch.eq(input_ids[:, prompt_length:], self.tokenizer.pad_token_id).int()  # (0, 0, ..., 0, 1, ... 1, 1)
+        response_mask = torch.cumsum(response_mask, 1) - response_mask  # first padding token is 0, otherwise 1
+        response_mask = torch.eq(response_mask, 0).int()
+        input_mask = torch.cat((tiled_mask, response_mask), dim=1)
+
+        return input_ids, input_mask
 
