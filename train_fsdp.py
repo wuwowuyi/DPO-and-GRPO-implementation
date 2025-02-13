@@ -17,7 +17,7 @@ from transformers import GPT2Tokenizer
 
 import wandb
 from gpt2 import get_model
-from policy import Policy, Reward, DPO
+from policy import Policy, Reward, DPO, RejectionSamplingDPO
 from tldr_dataset import TldrCompletion, TldrPreference
 from utils import setup, cleanup, check_fn, fsdp_dict, set_seed, save_model_checkpoint
 
@@ -25,8 +25,6 @@ from utils import setup, cleanup, check_fn, fsdp_dict, set_seed, save_model_chec
 
 
 def train(config: dict):
-    set_seed(config['seed'])
-
     # FSDP environment variables and setup
     local_rank = int(os.environ['LOCAL_RANK'])  # rank on local node
     rank = int(os.environ['RANK'])  # global rank
@@ -34,6 +32,8 @@ def train(config: dict):
     setup()
     torch.cuda.set_device(local_rank)
     device = torch.cuda.current_device()
+
+    set_seed(config['seed'], rank)
 
     if config['wandb_log'] and rank == 0:  # wandb logging
         wandb_project = 'rejection_sampling'
@@ -45,18 +45,26 @@ def train(config: dict):
 
     # load model
     if config['model_for'] == 'sft':
-        dataset = TldrCompletion(tokenizer)
+        eval_dataset = dataset = TldrCompletion(tokenizer)
         model = Policy(FSDP(get_model(config), **fsdp_dict, device_id=device),
                         tokenizer, config, True, device)
     elif config['model_for'] == 'reward':
-        dataset = TldrPreference(tokenizer)
+        eval_dataset = dataset = TldrPreference(tokenizer)
         model = Reward(FSDP(get_model(config), **fsdp_dict, device_id=device),
                        tokenizer, config, trained_reward=False, device=device)
     elif config['model_for'] == 'dpo':
-        dataset = TldrPreference(tokenizer)
-        policy_ref = DPO(FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, False, device)
+        eval_dataset = dataset = TldrPreference(tokenizer)
+        policy_ref = Policy(FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, False, device)
         policy_ref.lm_model.eval()
-        model = DPO(FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, True, device)
+        model = DPO(policy_ref, FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, True, device)
+    elif config['model_for'] == 'dpo_rs':  # DPO + rejection sampling
+        dataset = TldrCompletion(tokenizer)
+        eval_dataset = TldrPreference(tokenizer)
+        policy_ref = Policy(FSDP(get_model(config['policy_ref']), **fsdp_dict, device_id=device), tokenizer, config, False, device)
+        policy_ref.lm_model.eval()
+        reward_model = Reward(FSDP(get_model(config['reward_model']), **fsdp_dict, device_id=device), tokenizer, config, trained_reward=True, device=device)
+        reward_model.lm_model.eval()
+        model = RejectionSamplingDPO(reward_model, policy_ref, FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, True, device)
     else:
         raise ValueError(f"Unknown model usage: {config['model_for']}")
 
@@ -67,30 +75,29 @@ def train(config: dict):
     local_total, local_batch_size = len(dataset) // world_size, config['batch_size'] // world_size
     best_eval_loss = None
     optimizer = model.configure_optimizers(config['lr'], wrapped=True)
-    scheduler = CosineAnnealingLR(optimizer, T_max=local_total // local_batch_size, eta_min=config['min_lr'])
+    scheduler = CosineAnnealingLR(optimizer, T_max=local_total * config['epoch'] // local_batch_size, eta_min=config['min_lr'])
 
-    local_eval_total = dataset.len_val() // world_size
+    local_eval_total = eval_dataset.len_val() // world_size
     eval_order = rank * local_eval_total + torch.arange(local_eval_total)
     def evaluation():
         model.lm_model.eval()
         eval_losses = []
-        for k in range(min(50, local_eval_total // local_batch_size)):
+        for k in range(min(100, local_eval_total // local_batch_size)):
             vidx = eval_order[k * local_batch_size: k * local_batch_size + local_batch_size]
-            eval_input_ids, eval_mask = dataset.get_batch(vidx, False)
+            eval_input_ids, eval_mask = eval_dataset.get_batch(vidx, False)
             eval_input_ids, eval_mask = eval_input_ids.to(device, dtype=torch.int32), eval_mask.to(device, dtype=torch.int32)
             with torch.no_grad():
-                if config['model_for'] == 'sft':
+                if config['model_for'] == 'sft' or config['model_for'] == 'dpo' or config['model_for'] == 'dpo_rs':
                     eval_loss = model.loss(eval_input_ids, eval_mask)
-                elif config['model_for'] == 'reward' or config['model_for'] == 'dpo':
+                elif config['model_for'] == 'reward':
                     eval_loss = 1 - model.eval_accuracy(eval_input_ids, eval_mask)
+                else:
+                    raise ValueError('unknown training model')
             eval_losses.append(eval_loss)
         model.lm_model.train()
 
         cur_eval_loss = torch.as_tensor(eval_losses, device=device).mean()
-        if config['model_for'] == 'sft':
-            print(f"eval loss is {cur_eval_loss.cpu().item():.4f} on rank {rank}")
-        elif config['model_for'] == 'reward' or config['model_for'] == 'dpo':
-            print(f"eval error rate is {cur_eval_loss.cpu().item():.4f} on rank {rank}")
+        print(f"eval error rate or loss is {cur_eval_loss.cpu().item():.4f} on rank {rank}")
 
         distributed.all_reduce(cur_eval_loss, op=distributed.ReduceOp.AVG)
         nonlocal best_eval_loss
@@ -103,20 +110,23 @@ def train(config: dict):
             wandb.log({'eval': cur_eval_loss})
 
     loss_interval = 10
-    eval_interval = loss_interval * 50
+    eval_interval = loss_interval * 20
     for epoch in range(config['epoch']):
         print(f'Start training epoch {epoch}')
         dataset.shuffle()  # shuffle before each epoch
         order = rank * local_total + torch.randperm(local_total)
         for j in tqdm(range(local_total // local_batch_size), desc=f"epoch-{epoch} on rank-{rank}"):
             idx = order[j * local_batch_size: j * local_batch_size + local_batch_size]
-            input_ids, mask = dataset.get_batch(idx)
-            input_ids, mask = input_ids.to(device, dtype=torch.int32), mask.to(device, dtype=torch.int32)
 
-            if config['model_for'] == 'dpo':
-                loss = model.loss(input_ids, mask, policy_ref=policy_ref)
+            if config['model_for'] == 'dpo_rs':
+                input_ids, mask = dataset.get_batch(idx, with_completion=False)
+                input_ids, mask = input_ids.to(device, dtype=torch.int32), mask.to(device, dtype=torch.int32)
+                input_ids, mask = model.generate_pairs(input_ids, mask)
             else:
-                loss = model.loss(input_ids, mask)
+                input_ids, mask = dataset.get_batch(idx)
+                input_ids, mask = input_ids.to(device, dtype=torch.int32), mask.to(device, dtype=torch.int32)
+
+            loss = model.loss(input_ids, mask)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -162,6 +172,7 @@ def main():
 
     config['seed'] = args.seed
     config['wandb_log'] = args.wandb_log
+    config['parallel'] = 'FSDP'
 
     train(config)
 
