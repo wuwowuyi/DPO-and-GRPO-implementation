@@ -2,6 +2,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 
 import torch
+from torch import nn
 from transformers import GPT2LMHeadModel, GPT2Config
 
 
@@ -54,7 +55,10 @@ def get_model(config: dict) -> GPT2LMHeadModel:
         print(f"Load model {model_type} from checkpoint {config['ckpt']}")
         ckpt = torch.load(config['ckpt'], weights_only=True)
         model = GPT2LMHeadModel(mcfg)
+        if config['ckpt_type'] == 'reward':
+            model.lm_head = nn.Linear(mcfg.n_embd, 1, bias=False)
         model.load_state_dict(ckpt.pop('model'))
+        model.to(dtype=torch.bfloat16)
     else:
         print(f"Load a pretrained model {model_type} from Hugging Face pretrained")
         model = GPT2LMHeadModel.from_pretrained(model_type, config=mcfg, cache_dir=model_cache, torch_dtype=torch.bfloat16)
