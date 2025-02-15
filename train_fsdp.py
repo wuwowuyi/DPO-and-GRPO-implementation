@@ -36,7 +36,7 @@ def train(config: dict):
     set_seed(config['seed'], rank)
 
     if config['wandb_log'] and rank == 0:  # wandb logging
-        wandb_project = 'rejection_sampling'
+        wandb_project = 'rejection_sampling2'
         wandb_run_name = f"{config['model']}-{config['model_for']}-{str(int(time.time()))}"
         wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
@@ -46,8 +46,7 @@ def train(config: dict):
     # load model
     if config['model_for'] == 'sft':
         eval_dataset = dataset = TldrCompletion(tokenizer)
-        model = Policy(FSDP(get_model(config), **fsdp_dict, device_id=device),
-                        tokenizer, config, True, device)
+        model = Policy(FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, True, device)
     elif config['model_for'] == 'reward':
         eval_dataset = dataset = TldrPreference(tokenizer)
         model = Reward(FSDP(get_model(config), **fsdp_dict, device_id=device),
@@ -84,11 +83,11 @@ def train(config: dict):
         eval_losses = []
         for k in range(min(100, local_eval_total // local_batch_size)):
             vidx = eval_order[k * local_batch_size: k * local_batch_size + local_batch_size]
-            eval_input_ids, eval_mask = eval_dataset.get_batch(vidx, False)
+            eval_input_ids, eval_mask, eval_prompt_length = eval_dataset.get_batch(vidx, False)
             eval_input_ids, eval_mask = eval_input_ids.to(device, dtype=torch.int32), eval_mask.to(device, dtype=torch.int32)
             with torch.no_grad():
                 if config['model_for'] == 'sft' or config['model_for'] == 'dpo' or config['model_for'] == 'dpo_rs':
-                    eval_loss = model.loss(eval_input_ids, eval_mask)
+                    eval_loss = model.loss(eval_input_ids, eval_mask, eval_prompt_length)
                 elif config['model_for'] == 'reward':
                     eval_loss = 1 - model.eval_accuracy(eval_input_ids, eval_mask)
                 else:
@@ -107,30 +106,30 @@ def train(config: dict):
             best_eval_loss = cur_eval_loss
             save_model_checkpoint(model.lm_model, rank, config)
         if config['wandb_log'] and rank == 0:
-            wandb.log({'eval': cur_eval_loss})
+            wandb.log({f"eval/{config['model_for']}": cur_eval_loss})
 
     loss_interval = 10
-    eval_interval = loss_interval * 20
+    eval_interval = loss_interval * 25
     for epoch in range(config['epoch']):
         print(f'Start training epoch {epoch}')
-        dataset.shuffle()  # shuffle before each epoch
+        dataset.shuffle(config['seed'] + epoch)  # shuffle before each epoch. use the same seed on all ranks!
         order = rank * local_total + torch.randperm(local_total)
         for j in tqdm(range(local_total // local_batch_size), desc=f"epoch-{epoch} on rank-{rank}"):
             idx = order[j * local_batch_size: j * local_batch_size + local_batch_size]
 
             if config['model_for'] == 'dpo_rs':
-                input_ids, mask = dataset.get_batch(idx, with_completion=False)
+                input_ids, mask, prompt_length = dataset.get_batch(idx, with_completion=False)
                 input_ids, mask = input_ids.to(device, dtype=torch.int32), mask.to(device, dtype=torch.int32)
                 input_ids, mask = model.generate_pairs(input_ids, mask)
             else:
-                input_ids, mask = dataset.get_batch(idx)
+                input_ids, mask, prompt_length = dataset.get_batch(idx)
                 input_ids, mask = input_ids.to(device, dtype=torch.int32), mask.to(device, dtype=torch.int32)
 
-            loss = model.loss(input_ids, mask)
-            optimizer.zero_grad()
+            loss = model.loss(input_ids, mask, prompt_length)
             loss.backward()
             optimizer.step()
             scheduler.step()
+            optimizer.zero_grad()  # release memory right away
 
             if j % eval_interval == 0:
                 evaluation()
@@ -140,8 +139,8 @@ def train(config: dict):
             if j % loss_interval == 0 and rank == 0:
                 if config['wandb_log']:
                     wandb.log({
-                        "loss": fsdp_loss,
-                        "lr": scheduler.get_lr()[0]
+                        f"loss/{config['model_for']}": fsdp_loss,
+                        f"lr/{config['model_for']}": scheduler.get_lr()[0]
                     })
                 else:
                     print(f"training loss is {fsdp_loss.item():.4f}")
