@@ -30,20 +30,21 @@ class LLM:
             for param in self.lm_model.parameters():
                 param.requires_grad_(False)
 
-    def loss(self, input_ids: torch.Tensor, mask: torch.Tensor, **kwargs):
+    def loss(self, input_ids: torch.Tensor, mask: torch.Tensor, prompt_length: int, **kwargs):
         """
         Supervised fine-tuning loss.
 
         :param input_ids: concatenation of prompt + completion token. shape=(batch_size, sequence_length)
         :param mask: mask of a padding token should be zero otherwise 1.
+        :param prompt_length: length of prompt in sequence
         :return:
         """
         input_token, attention_mask = input_ids[:, :-1].clone(), mask[:, :-1]
-        logits = self.lm_model(input_token, attention_mask=attention_mask).logits  # shape=(n, seq-1, vocab_size)
-        label = input_ids[:, 1:]
+        logits = self.lm_model(input_token, attention_mask=attention_mask).logits[:, prompt_length-1:, :]  # shape=(n, response_length, vocab_size)
+        label = input_ids[:, prompt_length:]  # we only care the response
         b, t = label.shape
         loss = F.cross_entropy(logits.reshape(b * t, -1), label.reshape(-1).long(), reduction='none')
-        loss = torch.mean(loss.reshape(b, t) * mask[:, 1:])  # ignore loss on the padding tokens
+        loss = torch.mean(loss.reshape(b, t) * mask[:, prompt_length:])  # ignore loss on the padding tokens
         return loss
 
     def configure_optimizers(self, learning_rate, wrapped=False, weight_decay=1e-2):
@@ -81,26 +82,27 @@ class LLM:
 
 class Policy(LLM):
 
-    def log_prob(self, input_ids, mask, avg_seq: bool = True, scale: bool = False):
+    def log_prob(self, input_ids, mask, prompt_length: int, avg_seq: bool = True, scale: bool = False):
         """
         Compute per token(step) log probability.
 
         :param input_ids: shape=(n, sequence_length)
         :param mask: shape=(n, sequence_length). mask of a padding token should be zero otherwise 1.
-        :param avg_seq: whether to take an average over the entire sequence
+        :param prompt_length: length of prompt in sequence
+        :param avg_seq: whether to take an average over the entire response
 
-        :return: logp shape=(n,) if average over sequence else shape=(n, sequence_length-1)
+        :return: logp shape=(n,) if average over response else shape=(n, response_length)
         """
         input_token, attention_mask = input_ids[:, :-1].clone(), mask[:, :-1]
-        logits = self.lm_model(input_token, attention_mask=attention_mask).logits  # shape=(n, seq-1, vocab_size)
+        logits = self.lm_model(input_token, attention_mask=attention_mask).logits[:, prompt_length-1:, :]  # shape=(n, response_length, vocab_size)
 
         if scale:  # scaled by temperature
             logits /= torch.as_tensor(self.config['temperature'], dtype=torch.bfloat16, device=self.device)
 
-        label = input_ids[:, 1:]  # shape=(n, seq-1)
+        label = input_ids[:, prompt_length:]  # shape=(n, response_length)
         n, response_length = label.shape
         logp = -F.cross_entropy(logits.reshape(n * response_length, -1), label.reshape(-1).long(), reduction='none')  # shape=(n * response_length,)
-        logp = logp.reshape(n, response_length) * mask[:, 1:]  # ignore logp on the padding tokens
+        logp = logp.reshape(n, response_length) * mask[:, prompt_length:]  # ignore logp on the padding tokens
         return torch.sum(logp, dim=-1) if avg_seq else logp
 
     @torch.no_grad()
@@ -175,7 +177,14 @@ class Reward(LLM):
 
         # todo: normalization
 
-    def compute_reward(self, input_ids, mask, padding_side='left'):
+    def compute_reward(self, input_ids, mask, padding_side='both'):
+        """
+        Compute reward of the entire sequence
+        :param input_ids:
+        :param mask:
+        :param padding_side:
+        :return:
+        """
         logits = self.lm_model(input_ids, attention_mask=mask).logits.squeeze(2)  # shape=(n, sequence_length)
         if padding_side == 'left':
             logits = logits[:, -1]  # all padding tokens are on the left
@@ -186,7 +195,7 @@ class Reward(LLM):
             raise ValueError("padding_side value should be left, right or both")
         return logits
 
-    def loss(self, input_ids, mask, **kwargs):
+    def loss(self, input_ids, mask, prompt_length, **kwargs):
         rewards = self.compute_reward(input_ids, mask)  # shape=(n, )
         rewards = torch.stack(torch.tensor_split(rewards, 2)).transpose(0, 1)  # shape=(n//2, 2)
         labels = torch.zeros(len(input_ids) // 2).to(self.device, dtype=torch.int64)  # first half chosen
@@ -222,11 +231,11 @@ class DPO(Policy):
         super().__init__(lm_model, tokenizer, config, train, device)
         self.policy_ref = policy_ref
 
-    def loss(self, input_ids, mask, **kwargs):
+    def loss(self, input_ids, mask, prompt_length, **kwargs):
         with torch.no_grad():
-            logp_ref = self.policy_ref.log_prob(input_ids, mask)
+            logp_ref = self.policy_ref.log_prob(input_ids, mask, prompt_length)
 
-        logp = self.log_prob(input_ids, mask)
+        logp = self.log_prob(input_ids, mask, prompt_length)
 
         b = input_ids.shape[0] // 2
         # win_idx: index of prompt + chosen response.
@@ -282,7 +291,7 @@ class RejectionSampling:
         # call reward_model to compute rewards
         reward_input = torch.cat((prompt, processed), dim=1)  # prompt left padded, response right padded.
         reward_mask = torch.cat((mask, processed_mask), dim=1)
-        raw_rewards = reward_model.compute_reward(reward_input, reward_mask, padding_side='both')  # shape=(n * n_samples,)
+        raw_rewards = reward_model.compute_reward(reward_input, reward_mask)  # shape=(n * n_samples,)
         # normalize rewards per group
         rewards = torch.stack(torch.split(raw_rewards, n_samples))  # shape=(n, n_samples)
         group_mean, group_std = rewards.mean(dim=1, keepdim=True), rewards.std(dim=1, keepdim=True)
