@@ -32,8 +32,7 @@ bfSixteen = MixedPrecision(
 )
 fsdp_dict = {
     'auto_wrap_policy': functools.partial(transformer_auto_wrap_policy, transformer_layer_cls={GPT2Block}),
-    'mixed_precision': bfSixteen,
-    'use_orig_params': True
+    'mixed_precision': bfSixteen
 }
 
 
