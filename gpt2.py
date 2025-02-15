@@ -58,10 +58,10 @@ def get_model(config: dict) -> GPT2LMHeadModel:
         if config['ckpt_type'] == 'reward':
             model.lm_head = nn.Linear(mcfg.n_embd, 1, bias=False)
         model.load_state_dict(ckpt.pop('model'))
-        model.to(dtype=torch.bfloat16)
+        #model.to(dtype=torch.bfloat16)  # seems to brings down performance
     else:
         print(f"Load a pretrained model {model_type} from Hugging Face pretrained")
-        model = GPT2LMHeadModel.from_pretrained(model_type, config=mcfg, cache_dir=model_cache, torch_dtype=torch.bfloat16)
+        model = GPT2LMHeadModel.from_pretrained(model_type, config=mcfg, cache_dir=model_cache, torch_dtype=torch.float32)
 
     return model
 
