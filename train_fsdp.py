@@ -76,14 +76,14 @@ def train(config: dict):
     optimizer = model.configure_optimizers(config['lr'], wrapped=True)
     scheduler = CosineAnnealingLR(optimizer, T_max=local_total * config['epoch'] // local_batch_size, eta_min=config['min_lr'])
 
-    local_eval_total = eval_dataset.len_val() // world_size
+    local_eval_total, local_eval_batch_size = eval_dataset.len_val() // world_size, config['eval_batch_size'] // world_size
     eval_order = rank * local_eval_total + torch.arange(local_eval_total)
     def evaluation():
         model.lm_model.eval()
         eval_losses = []
-        for k in range(min(100, local_eval_total // local_batch_size)):
-            vidx = eval_order[k * local_batch_size: k * local_batch_size + local_batch_size]
-            eval_input_ids, eval_mask, eval_prompt_length = eval_dataset.get_batch(vidx, False)
+        for k in range(min(100, local_eval_total // local_eval_batch_size)):
+            vidx = eval_order[k * local_eval_batch_size: k * local_eval_batch_size + local_eval_batch_size]
+            eval_input_ids, eval_mask, eval_prompt_length = eval_dataset.get_batch(vidx, train=False)
             eval_input_ids, eval_mask = eval_input_ids.to(device, dtype=torch.int32), eval_mask.to(device, dtype=torch.int32)
             with torch.no_grad():
                 if config['model_for'] == 'sft' or config['model_for'] == 'dpo' or config['model_for'] == 'dpo_rs':
@@ -117,16 +117,23 @@ def train(config: dict):
         for j in tqdm(range(local_total // local_batch_size), desc=f"epoch-{epoch} on rank-{rank}"):
             idx = order[j * local_batch_size: j * local_batch_size + local_batch_size]
 
-            if config['model_for'] == 'dpo_rs':
-                input_ids, mask, prompt_length = dataset.get_batch(idx, with_completion=False)
-                input_ids, mask = input_ids.to(device, dtype=torch.int32), mask.to(device, dtype=torch.int32)
-                input_ids, mask = model.generate_pairs(input_ids, mask)
-            else:
-                input_ids, mask, prompt_length = dataset.get_batch(idx)
-                input_ids, mask = input_ids.to(device, dtype=torch.int32), mask.to(device, dtype=torch.int32)
+            micro_batch_size = local_batch_size // config['gradient_step']
+            losses = []
+            for j_micro in range(config['gradient_step']):
+                slice_idx = slice(j_micro * micro_batch_size, j_micro * micro_batch_size + micro_batch_size)
+                if config['model_for'] == 'dpo_rs':
+                    input_ids, mask, prompt_length = dataset.get_batch(idx[slice_idx], with_completion=False)
+                    input_ids, mask = input_ids.to(device, dtype=torch.int32), mask.to(device, dtype=torch.int32)
+                    input_ids, mask = model.generate_pairs(input_ids, mask)
+                else:
+                    input_ids, mask, prompt_length = dataset.get_batch(idx[slice_idx])
+                    input_ids, mask = input_ids.to(device, dtype=torch.int32), mask.to(device, dtype=torch.int32)
 
-            loss = model.loss(input_ids, mask, prompt_length)
-            loss.backward()
+                loss = model.loss(input_ids, mask, prompt_length)
+                (loss / config['gradient_step']).backward()
+                losses.append(loss.clone().detach())
+
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.lm_model.parameters(), config['max_gradient']).detach()
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()  # release memory right away
@@ -134,13 +141,15 @@ def train(config: dict):
             if j % eval_interval == 0:
                 evaluation()
 
-            fsdp_loss = loss.clone().detach()
+            distributed.all_reduce(grad_norm, op=distributed.ReduceOp.AVG)
+            fsdp_loss = torch.stack(losses).mean()
             distributed.all_reduce(fsdp_loss, op=distributed.ReduceOp.AVG)
             if j % loss_interval == 0 and rank == 0:
                 if config['wandb_log']:
                     wandb.log({
                         f"loss/{config['model_for']}": fsdp_loss,
-                        f"lr/{config['model_for']}": scheduler.get_lr()[0]
+                        f"lr/{config['model_for']}": scheduler.get_last_lr()[0],
+                        f"grad_norm/{config['model_for']}": grad_norm
                     })
                 else:
                     print(f"training loss is {fsdp_loss.item():.4f}")
