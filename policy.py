@@ -51,14 +51,13 @@ class LLM:
     def eval_accuracy(self, input_ids, mask, prompt_length):
         return self.loss(input_ids, mask, prompt_length)
 
-    def configure_optimizers(self, learning_rate, wrapped=False, weight_decay=1e-2):
+    def configure_optimizers(self, learning_rate, weight_decay=1e-2):
         """
         Adapted from nanoGPT https://github.com/karpathy/nanoGPT
         """
         def prepare_arguments():
             # start with all of the candidate parameters
-            module = self.lm_model.module if wrapped else self.lm_model
-            param_dict = {pn: p for pn, p in module.named_parameters()}
+            param_dict = {pn: p for pn, p in self.lm_model.named_parameters()}
             # filter out those that do not require grad
             param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
             # create optim groups.
@@ -173,10 +172,10 @@ class Reward(LLM):
         if not trained_reward:
             n_embd = model_param[config['model']].n_embd  # dimension of embedding, i.e. hidden_size
             if isinstance(lm_model, FSDP):
-                self.lm_model.module.lm_head = nn.Linear(n_embd, 1, bias=False, device=self.device, dtype=torch.float32)
+                self.lm_model.module.lm_head = nn.Linear(n_embd, 1, bias=False, device=self.device, dtype=torch.bfloat16)
                 torch.nn.init.normal_(self.lm_model.module.lm_head.weight, std=1 / np.sqrt(n_embd + 1))
             else:
-                self.lm_model.lm_head = nn.Linear(n_embd, 1, bias=False, device=self.device, dtype=torch.float32)
+                self.lm_model.lm_head = nn.Linear(n_embd, 1, bias=False, device=self.device, dtype=torch.bfloat16)
                 torch.nn.init.normal_(self.lm_model.lm_head.weight, std=1 / np.sqrt(n_embd + 1))
 
         # todo: normalization

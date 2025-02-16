@@ -70,11 +70,13 @@ def train(config: dict):
 
     if 'activation_checkpointing' in config and config['activation_checkpointing']:
         apply_activation_checkpointing(model.lm_model, check_fn=check_fn)
+
+    model.lm_model = torch.compile(model.lm_model)
     model.lm_model.train()
 
     local_total, local_batch_size = len(dataset) // world_size, config['batch_size'] // world_size
     best_eval_loss = None
-    optimizer = model.configure_optimizers(config['lr'], wrapped=True)
+    optimizer = model.configure_optimizers(config['lr'])
     scheduler = CosineAnnealingLR(optimizer, T_max=local_total * config['epoch'] // local_batch_size, eta_min=config['min_lr'])
 
     local_eval_total, local_eval_batch_size = eval_dataset.len_val() // world_size, config['eval_batch_size'] // world_size
