@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import torch
@@ -80,25 +81,28 @@ def train(config: dict):
     eval_order = rank * local_eval_total + torch.arange(local_eval_total)
     def evaluation():
         model.lm_model.eval()
-        eval_losses = []
+        eval_losses, eval_metrics = [], defaultdict(list)
         for k in range(min(100, local_eval_total // local_eval_batch_size)):
             vidx = eval_order[k * local_eval_batch_size: k * local_eval_batch_size + local_eval_batch_size]
             eval_input_ids, eval_mask, eval_prompt_length = eval_dataset.get_batch(vidx, train=False)
             eval_input_ids, eval_mask = eval_input_ids.to(device, dtype=torch.int32), eval_mask.to(device, dtype=torch.int32)
-            with torch.no_grad():
-                if config['model_for'] == 'sft' or config['model_for'] == 'dpo' or config['model_for'] == 'dpo_rs':
-                    eval_loss = model.loss(eval_input_ids, eval_mask, eval_prompt_length)
-                elif config['model_for'] == 'reward':
-                    eval_loss = 1 - model.eval_accuracy(eval_input_ids, eval_mask)
-                else:
-                    raise ValueError('unknown training model')
+
+            eval_loss, eval_metric = model.eval_accuracy(eval_input_ids, eval_mask, eval_prompt_length)
+
             eval_losses.append(eval_loss)
+            for mk, mv in eval_metric.items():
+                eval_metrics[mk].append(mv)
         model.lm_model.train()
 
+        # sync metrics. change happens in-place
         cur_eval_loss = torch.as_tensor(eval_losses, device=device).mean()
         print(f"eval error rate or loss is {cur_eval_loss.cpu().item():.4f} on rank {rank}")
-
         distributed.all_reduce(cur_eval_loss, op=distributed.ReduceOp.AVG)
+        for mk, mv in eval_metrics.items():
+            mv = torch.stack(mv).mean()
+            distributed.all_reduce(mv, op=distributed.ReduceOp.AVG)
+            eval_metrics[mk] = mv
+
         nonlocal best_eval_loss
         if best_eval_loss is None:
             best_eval_loss = cur_eval_loss
@@ -106,7 +110,10 @@ def train(config: dict):
             best_eval_loss = cur_eval_loss
             save_model_checkpoint(model.lm_model, rank, config)
         if config['wandb_log'] and rank == 0:
-            wandb.log({f"eval/{config['model_for']}": cur_eval_loss})
+            wandb.log({
+                f"eval/{config['model_for']}": cur_eval_loss,
+                **eval_metrics
+            })
 
     loss_interval = 10
     eval_interval = loss_interval * 25
@@ -118,7 +125,7 @@ def train(config: dict):
             idx = order[j * local_batch_size: j * local_batch_size + local_batch_size]
 
             micro_batch_size = local_batch_size // config['gradient_step']
-            losses = []
+            losses, metrics = [], defaultdict(list)
             for j_micro in range(config['gradient_step']):
                 slice_idx = slice(j_micro * micro_batch_size, j_micro * micro_batch_size + micro_batch_size)
                 if config['model_for'] == 'dpo_rs':
@@ -129,9 +136,12 @@ def train(config: dict):
                     input_ids, mask, prompt_length = dataset.get_batch(idx[slice_idx])
                     input_ids, mask = input_ids.to(device, dtype=torch.int32), mask.to(device, dtype=torch.int32)
 
-                loss = model.loss(input_ids, mask, prompt_length)
+                loss, metric = model.loss(input_ids, mask, prompt_length)
                 (loss / config['gradient_step']).backward()
+                # preserve micro-batch metrics
                 losses.append(loss.clone().detach())
+                for mk, mv in metric.items():
+                    metrics[mk].append(mv)
 
             grad_norm = torch.nn.utils.clip_grad_norm_(model.lm_model.parameters(), config['max_gradient']).detach()
             optimizer.step()
@@ -141,15 +151,22 @@ def train(config: dict):
             if j % eval_interval == 0:
                 evaluation()
 
+            # sync metrics. change happens in-place
             distributed.all_reduce(grad_norm, op=distributed.ReduceOp.AVG)
             fsdp_loss = torch.stack(losses).mean()
             distributed.all_reduce(fsdp_loss, op=distributed.ReduceOp.AVG)
+            for mk, mv in metrics.items():
+                mv = torch.stack(mv).mean()
+                distributed.all_reduce(mv, op=distributed.ReduceOp.AVG)
+                metrics[mk] = mv
+
             if j % loss_interval == 0 and rank == 0:
                 if config['wandb_log']:
                     wandb.log({
                         f"loss/{config['model_for']}": fsdp_loss,
                         f"lr/{config['model_for']}": scheduler.get_last_lr()[0],
-                        f"grad_norm/{config['model_for']}": grad_norm
+                        f"grad_norm/{config['model_for']}": grad_norm,
+                        **metrics
                     })
                 else:
                     print(f"training loss is {fsdp_loss.item():.4f}")
