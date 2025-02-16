@@ -45,7 +45,11 @@ class LLM:
         b, t = label.shape
         loss = F.cross_entropy(logits.reshape(b * t, -1), label.reshape(-1).long(), reduction='none')
         loss = torch.mean(loss.reshape(b, t) * mask[:, prompt_length:])  # ignore loss on the padding tokens
-        return loss
+        return loss, {}
+
+    @torch.no_grad()
+    def eval_accuracy(self, input_ids, mask, prompt_length):
+        return self.loss(input_ids, mask, prompt_length)
 
     def configure_optimizers(self, learning_rate, wrapped=False, weight_decay=1e-2):
         """
@@ -177,7 +181,7 @@ class Reward(LLM):
 
         # todo: normalization
 
-    def compute_reward(self, input_ids, mask, padding_side='both'):
+    def _compute_reward(self, input_ids, mask, padding_side='both'):
         """
         Compute reward of the entire sequence
         :param input_ids:
@@ -195,19 +199,30 @@ class Reward(LLM):
             raise ValueError("padding_side value should be left, right or both")
         return logits
 
-    def loss(self, input_ids, mask, prompt_length, **kwargs):
-        rewards = self.compute_reward(input_ids, mask)  # shape=(n, )
+    def _compute_loss(self, rewards):
         rewards = torch.stack(torch.tensor_split(rewards, 2)).transpose(0, 1)  # shape=(n//2, 2)
-        labels = torch.zeros(len(input_ids) // 2).to(self.device, dtype=torch.int64)  # first half chosen
+        labels = torch.zeros(len(rewards)).to(self.device, dtype=torch.int64)  # first half chosen
         loss = F.cross_entropy(rewards, labels)
         return loss
 
+    def loss(self, input_ids, mask, prompt_length, **kwargs):
+        rewards = self._compute_reward(input_ids, mask)  # shape=(n, )
+        loss = self._compute_loss(rewards)
+        return loss, {
+            f"reward/{self.config['model_for']}_train_chosen": torch.mean(rewards[:, 0]),
+            f"reward/{self.config['model_for']}_train_rejected": torch.mean(rewards[:, 1]),
+            f"reward/{self.config['model_for']}_train_acc": (rewards[:, 0] > rewards[:, 1]).float().mean()
+        }
+
     @torch.no_grad()
-    def eval_accuracy(self, input_ids, mask):
-        rewards = self.compute_reward(input_ids, mask)  # shape=(n, )
-        rewards = torch.stack(torch.tensor_split(rewards, 2)).transpose(0, 1)  # shape=(n//2, 2)
-        acc = torch.mean(rewards[:, 0] > rewards[:, 1], dtype=torch.float16)
-        return acc
+    def eval_accuracy(self, input_ids, mask, prompt_length):
+        rewards = self._compute_reward(input_ids, mask)  # shape=(n, )
+        loss = self._compute_loss(rewards)
+        return loss, {
+            f"reward/{self.config['model_for']}_eval_chosen": torch.mean(rewards[:, 0]),
+            f"reward/{self.config['model_for']}_eval_rejected": torch.mean(rewards[:, 1]),
+            f"reward/{self.config['model_for']}_eval_acc": (rewards[:, 0] > rewards[:, 1]).float().mean()
+        }
 
 
 class DPO(Policy):
@@ -231,13 +246,8 @@ class DPO(Policy):
         super().__init__(lm_model, tokenizer, config, train, device)
         self.policy_ref = policy_ref
 
-    def loss(self, input_ids, mask, prompt_length, **kwargs):
-        with torch.no_grad():
-            logp_ref = self.policy_ref.log_prob(input_ids, mask, prompt_length)
-
-        logp = self.log_prob(input_ids, mask, prompt_length)
-
-        b = input_ids.shape[0] // 2
+    def _compute_loss_reward(self, logp, logp_ref):
+        b = logp.shape[0] // 2
         # win_idx: index of prompt + chosen response.
         # lose_idx: index of prompt + rejected response.
         win_idx, lose_idx = torch.arange(b, device=self.device), torch.arange(b, 2 * b, device=self.device)
@@ -246,16 +256,33 @@ class DPO(Policy):
         loss_logits = (logp_w - logp_l) - (logp_ref_w - logp_ref_l)
         beta, label_smoothing = self.config['beta'], self.config['label_smoothing']
         loss = -F.logsigmoid(beta * loss_logits) * (1 - label_smoothing) - F.logsigmoid(-beta * loss_logits) * label_smoothing
-        return loss.mean()
+        reward_w = beta * (logp_w.detach() - logp_ref_w)
+        reward_l = beta * (logp_l.detach() - logp_ref_l)
+        return loss.mean(), reward_w, reward_l
+
+    def loss(self, input_ids, mask, prompt_length, **kwargs):
+        with torch.no_grad():
+            logp_ref = self.policy_ref.log_prob(input_ids, mask, prompt_length)
+        logp = self.log_prob(input_ids, mask, prompt_length)
+
+        loss, reward_w, reward_l = self._compute_loss_reward(logp, logp_ref)
+        return loss, {
+            f"reward/{self.config['model_for']}_chosen": reward_w.mean(),
+            f"reward/{self.config['model_for']}_rejected": reward_l.mean(),
+            f"reward/{self.config['model_for']}_acc": (reward_w > reward_l).float().mean()
+        }
 
     @torch.no_grad()
-    def eval_accuracy(self, input_ids, mask):
-        logp = self.log_prob(input_ids, mask)
-        b = input_ids.shape[0] // 2
-        win_idx, lose_idx = torch.arange(b, device=self.device), torch.arange(b, 2 * b, device=self.device)
-        logp_w, logp_l = logp[win_idx], logp[lose_idx]
-        acc = torch.mean(logp_w > logp_l, dtype=torch.float16)
-        return acc
+    def eval_accuracy(self, input_ids, mask, prompt_length):
+        logp_ref = self.policy_ref.log_prob(input_ids, mask, prompt_length)
+        logp = self.log_prob(input_ids, mask, prompt_length)
+
+        loss, reward_w, reward_l = self._compute_loss_reward(logp, logp_ref)
+        return loss, {
+            f"reward/{self.config['model_for']}_eval_chosen": reward_w.mean(),
+            f"reward/{self.config['model_for']}_eval_rejected": reward_l.mean(),
+            f"reward/{self.config['model_for']}_eval_acc": (reward_w > reward_l).float().mean()
+        }
 
 
 class RejectionSampling:
@@ -385,4 +412,3 @@ class RejectionSamplingDPO(DPO, RejectionSampling):
         input_mask = torch.cat((tiled_mask, response_mask), dim=1)
 
         return input_ids, input_mask
-
