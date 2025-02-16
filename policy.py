@@ -173,10 +173,10 @@ class Reward(LLM):
         if not trained_reward:
             n_embd = model_param[config['model']].n_embd  # dimension of embedding, i.e. hidden_size
             if isinstance(lm_model, FSDP):
-                self.lm_model.module.lm_head = nn.Linear(n_embd, 1, bias=False, device=self.device, dtype=torch.bfloat16)
+                self.lm_model.module.lm_head = nn.Linear(n_embd, 1, bias=False, device=self.device, dtype=torch.float32)
                 torch.nn.init.normal_(self.lm_model.module.lm_head.weight, std=1 / np.sqrt(n_embd + 1))
             else:
-                self.lm_model.lm_head = nn.Linear(n_embd, 1, bias=False, device=self.device, dtype=torch.bfloat16)
+                self.lm_model.lm_head = nn.Linear(n_embd, 1, bias=False, device=self.device, dtype=torch.float32)
                 torch.nn.init.normal_(self.lm_model.lm_head.weight, std=1 / np.sqrt(n_embd + 1))
 
         # todo: normalization
