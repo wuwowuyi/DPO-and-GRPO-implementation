@@ -95,7 +95,7 @@ class TldrPreference(TldrDataset):
 
     def get_batch(self, idx: torch.Tensor, train: bool = True) -> tuple[torch.Tensor, torch.Tensor, int]:
         items = self.train[idx] if train else self.val[idx]
-        prompts, chosens, rejects, prompt_masks, chosen_masks, reject_masks = [], [], [], []
+        prompts, chosens, rejects, prompt_masks, chosen_masks, reject_masks = [], [], [], [], [], []
 
         for prompt, chosen, rejected in zip(items['prompt'], items['chosen'], items['rejected']):
             prompt_token = self.extract_prompt(prompt)
@@ -124,6 +124,7 @@ class TldrPreference(TldrDataset):
         )
 
         # outputs
+        prompts, prompt_masks = torch.cat((prompts, prompts)), torch.cat((prompt_masks, prompt_masks))
         input_ids = torch.cat((prompts, completions), dim=1)
         mask = torch.cat((prompt_masks, completion_masks), dim=1)
         prompt_length = prompts.shape[1]
