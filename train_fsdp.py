@@ -37,8 +37,8 @@ def train(config: dict):
     set_seed(config['seed'], rank)
 
     if config['wandb_log'] and rank == 0:  # wandb logging
-        wandb_project = 'rejection_sampling2'
-        wandb_run_name = f"{config['model']}-{config['model_for']}-{str(int(time.time()))}"
+        wandb_project = 'dpo_grpo_rs'
+        wandb_run_name = f"{config['model_for']}-{config['model']}-{str(int(time.time()))}"
         wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
@@ -71,7 +71,11 @@ def train(config: dict):
     if 'activation_checkpointing' in config and config['activation_checkpointing']:
         apply_activation_checkpointing(model.lm_model, check_fn=check_fn)
 
-    model.lm_model = torch.compile(model.lm_model)
+    # compile not working.
+    # torch._dynamo.exc.InternalTorchDynamoError: RuntimeError: attempting to assign a gradient of size '[32821120]' to a tensor of size '[65642240]'.
+    # Please ensure that the gradient and the tensor are the same size
+    #model.lm_model = torch.compile(model.lm_model)  # not working.
+
     model.lm_model.train()
 
     local_total, local_batch_size = len(dataset) // world_size, config['batch_size'] // world_size
@@ -113,12 +117,12 @@ def train(config: dict):
             save_model_checkpoint(model.lm_model, rank, config)
         if config['wandb_log'] and rank == 0:
             wandb.log({
-                f"eval/{config['model_for']}": cur_eval_loss,
+                f"loss/{config['model_for']}_eval": cur_eval_loss,
                 **eval_metrics
             })
 
-    loss_interval = 10
-    eval_interval = loss_interval * 25
+    loss_interval = 1
+    eval_interval = loss_interval * 100
     for epoch in range(config['epoch']):
         print(f'Start training epoch {epoch}')
         dataset.shuffle(config['seed'] + epoch)  # shuffle before each epoch. use the same seed on all ranks!
@@ -165,7 +169,7 @@ def train(config: dict):
             if j % loss_interval == 0 and rank == 0:
                 if config['wandb_log']:
                     wandb.log({
-                        f"loss/{config['model_for']}": fsdp_loss,
+                        f"loss/{config['model_for']}_train": fsdp_loss,
                         f"lr/{config['model_for']}": scheduler.get_last_lr()[0],
                         f"grad_norm/{config['model_for']}": grad_norm,
                         **metrics

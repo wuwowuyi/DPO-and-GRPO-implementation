@@ -30,6 +30,8 @@ class LLM:
             for param in self.lm_model.parameters():
                 param.requires_grad_(False)
 
+            self.lm_model.to(dtype=torch.bfloat16)
+
     def loss(self, input_ids: torch.Tensor, mask: torch.Tensor, prompt_length: int, **kwargs):
         """
         Supervised fine-tuning loss.
@@ -266,9 +268,9 @@ class DPO(Policy):
 
         loss, reward_w, reward_l = self._compute_loss_reward(logp, logp_ref)
         return loss, {
-            f"reward/{self.config['model_for']}_chosen": reward_w.mean(),
-            f"reward/{self.config['model_for']}_rejected": reward_l.mean(),
-            f"reward/{self.config['model_for']}_acc": (reward_w > reward_l).float().mean()
+            f"reward/{self.config['model_for']}_train_chosen": reward_w.mean(),
+            f"reward/{self.config['model_for']}_train_rejected": reward_l.mean(),
+            f"reward/{self.config['model_for']}_train_acc": (reward_w > reward_l).float().mean()
         }
 
     @torch.no_grad()
