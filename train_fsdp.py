@@ -85,7 +85,8 @@ def train(config: dict):
 
     local_eval_total, local_eval_batch_size = eval_dataset.len_val() // world_size, config['eval_batch_size'] // world_size
     eval_order = rank * local_eval_total + torch.arange(local_eval_total)
-    def evaluation():
+
+    def evaluation(force_save:bool = False):
         model.lm_model.eval()
         eval_losses, eval_metrics = [], defaultdict(list)
         for k in range(min(100, local_eval_total // local_eval_batch_size)):
@@ -115,6 +116,9 @@ def train(config: dict):
         elif cur_eval_loss < best_eval_loss:
             best_eval_loss = cur_eval_loss
             save_model_checkpoint(model.lm_model, rank, config)
+        elif force_save:
+            save_model_checkpoint(model.lm_model, rank, config)
+
         if config['wandb_log'] and rank == 0:
             wandb.log({
                 f"loss/{config['model_for']}_eval": cur_eval_loss,
@@ -177,7 +181,7 @@ def train(config: dict):
                 else:
                     print(f"training loss is {fsdp_loss.item():.4f}")
         # at epoch end
-        evaluation()
+        evaluation(True)
 
     distributed.barrier()
     cleanup()

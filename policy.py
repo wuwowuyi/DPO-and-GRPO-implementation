@@ -209,20 +209,22 @@ class Reward(LLM):
     def loss(self, input_ids, mask, prompt_length, **kwargs):
         rewards = self._compute_reward(input_ids, mask)  # shape=(n, )
         loss = self._compute_loss(rewards)
+        k = rewards.shape[0] // 2
         return loss, {
-            f"reward/{self.config['model_for']}_train_chosen": torch.mean(rewards[:, 0]),
-            f"reward/{self.config['model_for']}_train_rejected": torch.mean(rewards[:, 1]),
-            f"reward/{self.config['model_for']}_train_acc": (rewards[:, 0] > rewards[:, 1]).float().mean()
+            f"reward/{self.config['model_for']}_train_chosen": torch.mean(rewards[:k]),
+            f"reward/{self.config['model_for']}_train_rejected": torch.mean(rewards[k:]),
+            f"reward/{self.config['model_for']}_train_acc": (rewards[:k] > rewards[k:]).float().mean()
         }
 
     @torch.no_grad()
     def eval_accuracy(self, input_ids, mask, prompt_length):
         rewards = self._compute_reward(input_ids, mask)  # shape=(n, )
         loss = self._compute_loss(rewards)
+        k = rewards.shape[0] // 2
         return loss, {
-            f"reward/{self.config['model_for']}_eval_chosen": torch.mean(rewards[:, 0]),
-            f"reward/{self.config['model_for']}_eval_rejected": torch.mean(rewards[:, 1]),
-            f"reward/{self.config['model_for']}_eval_acc": (rewards[:, 0] > rewards[:, 1]).float().mean()
+            f"reward/{self.config['model_for']}_eval_chosen": torch.mean(rewards[:k]),
+            f"reward/{self.config['model_for']}_eval_rejected": torch.mean(rewards[k:]),
+            f"reward/{self.config['model_for']}_eval_acc": (rewards[:k] > rewards[k:]).float().mean()
         }
 
 
