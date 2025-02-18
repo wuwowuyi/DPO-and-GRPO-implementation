@@ -61,7 +61,7 @@ def get_model(config: dict) -> GPT2LMHeadModel:
         #model.to(dtype=torch.bfloat16)  # use bfloat16 seems to bring down performance a little bit
     else:
         print(f"Load a pretrained model {model_type} from Hugging Face pretrained")
-        model = GPT2LMHeadModel.from_pretrained(model_type, config=mcfg, cache_dir=model_cache, torch_dtype=torch.torch32)
+        model = GPT2LMHeadModel.from_pretrained(model_type, config=mcfg, cache_dir=model_cache, torch_dtype=torch.float32)
 
     return model
 
