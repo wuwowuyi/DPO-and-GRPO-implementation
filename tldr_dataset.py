@@ -16,6 +16,7 @@ class TldrDataset:
         self.max_prompt_length = max_prompt_length
         self.max_response_length = max_response_length
         self.tensor_dtype = torch.int32
+        self.end_token_id = self.tokenizer.encode('\n')[0]  # 198 for GPT-2
 
     def __len__(self):
         return len(self.train)
@@ -66,7 +67,7 @@ class TldrCompletion(TldrDataset):
             prompt_masks.append(torch.ones(len(prompt_token)))
 
             completion_token = self.tokenizer.encode(completion)[:self.max_response_length-1]  # truncate end if too long
-            completion_token.append(self.tokenizer.eos_token_id)  # explicitly require an end token
+            completion_token.append(self.end_token_id)  # explicitly require an end token
             completions.append(torch.as_tensor(completion_token))
             completion_masks.append(torch.ones(len(completion_token)))
 
@@ -94,6 +95,13 @@ class TldrPreference(TldrDataset):
         super().__init__('trl-lib/tldr-preference', tokenizer)
 
     def get_batch(self, idx: torch.Tensor, train: bool = True) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """
+        prompt is left padded, and completion is right padded. so that we have a fixed prompt length of batched data.
+
+        :param idx:
+        :param train:
+        :return:
+        """
         items = self.train[idx] if train else self.val[idx]
         prompts, chosens, rejects, prompt_masks, chosen_masks, reject_masks = [], [], [], [], [], []
 
@@ -103,12 +111,12 @@ class TldrPreference(TldrDataset):
             prompt_masks.append(torch.ones(len(prompt_token)))
 
             chosen_token = self.tokenizer.encode(chosen)[:self.max_response_length-1]  # truncate end if too long
-            chosen_token = torch.as_tensor(chosen_token + [self.tokenizer.eos_token_id])
+            chosen_token = torch.as_tensor(chosen_token + [self.end_token_id])
             chosens.append(chosen_token)
             chosen_masks.append(torch.ones(len(chosen_token)))
 
             reject_token = self.tokenizer.encode(rejected)[:self.max_response_length-1]  # truncate end if too long
-            reject_token = torch.as_tensor(reject_token + [self.tokenizer.eos_token_id])
+            reject_token = torch.as_tensor(reject_token + [self.end_token_id])
             rejects.append(reject_token)
             reject_masks.append(torch.ones(len(reject_token)))
 
