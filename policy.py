@@ -53,20 +53,21 @@ class LLM:
     def eval_accuracy(self, input_ids, mask, prompt_length):
         return self.loss(input_ids, mask, prompt_length)
 
-    def configure_optimizers(self, learning_rate, weight_decay=1e-2):
+    @staticmethod
+    def configure_optimizers(parameters, learning_rate, weight_decay=1e-2):
         """
         Adapted from nanoGPT https://github.com/karpathy/nanoGPT
         """
         def prepare_arguments():
             # start with all of the candidate parameters
-            param_dict = {pn: p for pn, p in self.lm_model.named_parameters()}
+            param_dict = {pn: p for pn, p in parameters}
             # filter out those that do not require grad
             param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
             # create optim groups.
             # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
             decay_params, nodecay_params = [], []
             for n, p in param_dict.items():
-                if 'ln_' in n or 'bias' in n:
+                if 'ln_' in n or 'bias' in n or 'gain' in n:
                     nodecay_params.append(p)
                 else:
                     decay_params.append(p)
@@ -118,7 +119,9 @@ class Policy(LLM):
         Let's say n_samples = 8, then
         responses[:8] are responses to the first prompt, responses[8:16] second prompt, and so on.
 
-        NOTE: prompt padding tokens must be on the left!
+        NOTE:
+        1) prompt padding tokens must be on the left!
+        2) do NOT use position_ids
 
         :param prompt: shape=(n, prompt_length)
         :param mask: shape=(n, prompt_length). mask of a padding token should be zero otherwise 1.
@@ -136,6 +139,7 @@ class Policy(LLM):
                 prompt,
                 attention_mask=mask,
                 max_new_tokens=max_response_length,
+                #position_ids=torch.cumsum(mask, dim=1) - mask, # do NOT work. very bad response
                 do_sample=True,  # random sampling
                 temperature=self.config['temperature'],
                 pad_token_id=self.tokenizer.pad_token_id,
@@ -180,25 +184,43 @@ class Reward(LLM):
                 self.lm_model.lm_head = nn.Linear(n_embd, 1, bias=False, device=self.device, dtype=torch.bfloat16)
                 torch.nn.init.normal_(self.lm_model.lm_head.weight, std=1 / np.sqrt(n_embd + 1))
 
-        # todo: normalization
+            self.gain = torch.nn.Parameter(torch.tensor(1.0, device=self.device, dtype=torch.bfloat16), requires_grad=True)
+            self.bias = torch.nn.Parameter(torch.tensor(0.0, device=self.device, dtype=torch.bfloat16), requires_grad=True)
 
-    def _compute_reward(self, input_ids, mask, padding_side='both'):
+    @torch.no_grad()
+    def set_gain_bias(self, mean, std) -> None:
         """
-        Compute reward of the entire sequence
-        :param input_ids:
-        :param mask:
-        :param padding_side:
-        :return:
+        Compute and set gain and bias given current mean ans std, to get target mean 0 and std 1.
+
+        :param mean: current mean
+        :param std: current std
         """
-        logits = self.lm_model(input_ids, attention_mask=mask).logits.squeeze(2)  # shape=(n, sequence_length)
-        if padding_side == 'left':
-            logits = logits[:, -1]  # all padding tokens are on the left
-        elif padding_side == 'right' or padding_side == 'both':
-            idx = torch.cumsum(mask, -1).max(-1, keepdim=True).values - 1  # minus 1 because 0-indexed
-            logits = torch.gather(logits, -1, idx.long()).squeeze()  # shape=(n,)
-        else:
-            raise ValueError("padding_side value should be left, right or both")
-        return logits
+        print(f"current mean {mean} and std {std}")
+        target_mean = torch.tensor(0.0, dtype=mean.dtype, device=self.device)
+        target_std = torch.tensor(1.0, dtype=std.dtype, device=self.device)
+        gain = target_std / std
+        bias = target_mean - gain * mean
+        print(f"set gain and bias to {gain:.4f} and {bias:.4f}")
+        self.gain.copy_(gain)
+        self.bias.copy_(bias)
+
+    def compute_reward(self, input_ids, mask):
+        """
+        input_ids = prompt + response, to compute reward of the entire sequence
+
+        Note: ALL paddings tokens are on the left!
+
+        :param input_ids: shape=(n, sequence_length)
+        :param mask: shape=(n, sequence_length)
+        :return: rewards. shape=(n,)
+        """
+        # important for GPT2. ALL padding on left otherwise this is wrong.
+        # All the padding tokens have position id 0, and the sequence is 0, 1, ...
+        position_ids = torch.cumsum(mask, dim=1) - mask
+
+        output = self.lm_model(input_ids, attention_mask=mask, position_ids=position_ids)  # shape=(n, sequence_length, 1)
+        rewards = output.logits.squeeze(2)[:, -1]
+        return rewards * self.gain + self.bias.expand_as(rewards)
 
     def _compute_loss(self, rewards):
         rewards = torch.stack(torch.tensor_split(rewards, 2)).transpose(0, 1)  # shape=(n//2, 2)
@@ -207,18 +229,20 @@ class Reward(LLM):
         return loss
 
     def loss(self, input_ids, mask, prompt_length, **kwargs):
-        rewards = self._compute_reward(input_ids, mask)  # shape=(n, )
+        rewards = self.compute_reward(input_ids, mask)  # shape=(n, )
         loss = self._compute_loss(rewards)
         k = rewards.shape[0] // 2
         return loss, {
             f"reward/{self.config['model_for']}_train_chosen": torch.mean(rewards[:k]),
             f"reward/{self.config['model_for']}_train_rejected": torch.mean(rewards[k:]),
-            f"reward/{self.config['model_for']}_train_acc": (rewards[:k] > rewards[k:]).float().mean()
+            f"reward/{self.config['model_for']}_train_acc": (rewards[:k] > rewards[k:]).float().mean(),
+            f"reward/{self.config['model_for']}_gain": self.gain,
+            f"reward/{self.config['model_for']}_bias": self.bias,
         }
 
     @torch.no_grad()
     def eval_accuracy(self, input_ids, mask, prompt_length):
-        rewards = self._compute_reward(input_ids, mask)  # shape=(n, )
+        rewards = self.compute_reward(input_ids, mask)  # shape=(n, )
         loss = self._compute_loss(rewards)
         k = rewards.shape[0] // 2
         return loss, {
