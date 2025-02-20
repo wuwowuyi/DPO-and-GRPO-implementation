@@ -50,42 +50,38 @@ class TldrDataset:
         return [pad_sequence(t, batch_first=True, padding_value=pv, padding_side=ps)
                 for t, pv, ps in zip(tensors, padding_values, padding_sides)]
 
+
 class TldrCompletion(TldrDataset):
     """Dataset https://huggingface.co/datasets/trl-lib/tldr
-    For Supervised fine-tuning a base model
     """
 
     def __init__(self, tokenizer):
         super().__init__('trl-lib/tldr', tokenizer)
 
-    def get_batch(self, idx: torch.Tensor, train: bool = True, with_completion: bool = True) -> tuple[torch.Tensor, torch.Tensor, int]:
+    def get_batch(self, idx: torch.Tensor, train: bool = True, with_completion: bool = True) -> tuple[torch.Tensor, int]:
         items = self.train[idx] if train else self.val[idx]
-        prompts, completions, prompt_masks, completion_masks = [], [], [], []
+        prompts, completions = [], []
         for prompt, completion in zip(items['prompt'], items['completion']):
             prompt_token = self.extract_prompt(prompt)
             prompts.append(torch.as_tensor(prompt_token))
-            prompt_masks.append(torch.ones(len(prompt_token)))
-
             completion_token = self.tokenizer.encode(completion)[:self.max_response_length-1]  # truncate end if too long
             completion_token.append(self.end_token_id)  # explicitly require an end token
             completions.append(torch.as_tensor(completion_token))
-            completion_masks.append(torch.ones(len(completion_token)))
 
         # padding
-        prompts, prompt_masks, completions, completion_masks = self.pad(
-            (prompts, prompt_masks, completions, completion_masks),
-            (self.tokenizer.eos_token_id, 0, self.tokenizer.eos_token_id, 0),
-            ('left', 'left', 'right', 'right')
+        prompts, completions = self.pad(
+            (prompts, completions),
+            (self.tokenizer.eos_token_id, self.tokenizer.eos_token_id),
+            ('left', 'right')
         )
 
         # outputs
         if with_completion:
             input_ids = torch.cat((prompts, completions), dim=1)
-            mask = torch.cat((prompt_masks, completion_masks), dim=1)
         else:
-            input_ids, mask = prompts, prompt_masks
+            input_ids = prompts
         prompt_length = prompts.shape[1]
-        return input_ids, mask, prompt_length
+        return input_ids, prompt_length
 
 
 class TldrPreference(TldrDataset):
@@ -94,49 +90,44 @@ class TldrPreference(TldrDataset):
     def __init__(self, tokenizer):
         super().__init__('trl-lib/tldr-preference', tokenizer)
 
-    def get_batch(self, idx: torch.Tensor, train: bool = True) -> tuple[torch.Tensor, torch.Tensor, int]:
+    def get_batch(self, idx: torch.Tensor, train: bool = True) -> tuple[torch.Tensor, int]:
         """
-        prompt is left padded, and completion is right padded. so that we have a fixed prompt length of batched data.
+        Prompt is left padded, and completion is right padded. so that we have a fixed prompt length of batched data.
 
-        :param idx:
-        :param train:
-        :return:
+        :param idx: data points selection indices
+        :param train: from train dataset or not
+        :return: data samples
         """
         items = self.train[idx] if train else self.val[idx]
-        prompts, chosens, rejects, prompt_masks, chosen_masks, reject_masks = [], [], [], [], [], []
+        prompts, chosens, rejects = [], [], []
 
         for prompt, chosen, rejected in zip(items['prompt'], items['chosen'], items['rejected']):
             prompt_token = self.extract_prompt(prompt)
             prompts.append(torch.as_tensor(prompt_token))
-            prompt_masks.append(torch.ones(len(prompt_token)))
 
             chosen_token = self.tokenizer.encode(chosen)[:self.max_response_length-1]  # truncate end if too long
             chosen_token = torch.as_tensor(chosen_token + [self.end_token_id])
             chosens.append(chosen_token)
-            chosen_masks.append(torch.ones(len(chosen_token)))
 
             reject_token = self.tokenizer.encode(rejected)[:self.max_response_length-1]  # truncate end if too long
             reject_token = torch.as_tensor(reject_token + [self.end_token_id])
             rejects.append(reject_token)
-            reject_masks.append(torch.ones(len(reject_token)))
 
         # concatenate chosens and rejects. first half is chosen, second half reject
         chosens.extend(rejects)
-        chosen_masks.extend(reject_masks)
 
         # padding
-        prompts, prompt_masks, completions, completion_masks = self.pad(
-            (prompts, prompt_masks, chosens, chosen_masks),
-            (self.tokenizer.eos_token_id, 0, self.tokenizer.eos_token_id, 0),
-            ('left', 'left', 'right', 'right')
+        prompts, completions = self.pad(
+            (prompts, chosens),
+            (self.tokenizer.eos_token_id, self.tokenizer.eos_token_id),
+            ('left', 'right')
         )
 
         # outputs
-        prompts, prompt_masks = torch.cat((prompts, prompts)), torch.cat((prompt_masks, prompt_masks))
+        prompts = torch.cat((prompts, prompts))
         input_ids = torch.cat((prompts, completions), dim=1)
-        mask = torch.cat((prompt_masks, completion_masks), dim=1)
         prompt_length = prompts.shape[1]
-        return input_ids, mask, prompt_length
+        return input_ids, prompt_length
 
 
 if __name__ == '__main__':
