@@ -1,4 +1,5 @@
 import argparse
+import itertools
 import os
 import sys
 import time
@@ -18,24 +19,57 @@ from transformers import GPT2Tokenizer
 
 import wandb
 from gpt2 import get_model
-from policy import Policy, Reward, DPO, RejectionSamplingDPO
+from policy import Policy, Reward, DPO
 from tldr_dataset import TldrCompletion, TldrPreference
-from utils import setup, cleanup, check_fn, fsdp_dict, set_seed, save_model_checkpoint
+from utils import setup, cleanup, check_fn, fsdp_dict, set_seed, save_model_checkpoint, move_padding_left
 
 '''Train models on multiple GPUs using FSDP. '''
 
+# FSDP environment variables and setup
+local_rank = int(os.environ['LOCAL_RANK'])  # rank on local node
+rank = int(os.environ['RANK'])  # global rank
+world_size = int(os.environ['WORLD_SIZE'])  # total number of devices
+setup()
+torch.cuda.set_device(local_rank)
+device = torch.cuda.current_device()
+
+
+def normalize_reward(reward_model, policy, sampling_dataset, tokenizer, config):
+    """
+    Set reward model gain and bias to get reward mean 0 and std 1.
+    """
+
+    @torch.no_grad()
+    def sampling_rewards():
+        rewards = []
+        sample_order = rank * local_total + torch.randint(local_total, size=(sample_local_total,))
+        for si in range(sample_local_total // local_batch_size):
+            sample_idx = slice(si * local_batch_size, si * local_batch_size + local_batch_size)
+            prompt_ids, _ = sampling_dataset.get_batch(sample_order[sample_idx], with_completion=False)
+            prompt_ids = prompt_ids.to(device, dtype=torch.int32)
+            responses, _ = policy.generate(prompt_ids)
+            input_ids = move_padding_left(torch.cat((prompt_ids, responses), dim=1), tokenizer.pad_token_id)
+            rewards.append(reward_model.compute_reward(input_ids))
+        return rewards
+
+    sample_total = config['normalize_sample']
+    sample_local_total, local_batch_size = sample_total // world_size, config['batch_size'] // world_size
+    local_total = len(sampling_dataset) // world_size
+
+    # compute rewards mean and std to set gain and bias
+    rewards = sampling_rewards()
+    all_rewards = torch.zeros(sample_total, dtype=rewards[0].dtype, device=device)
+    distributed.all_gather_into_tensor(all_rewards, torch.cat(rewards))
+    reward_model.set_gain_bias(all_rewards.mean(), all_rewards.std())
+
+    # validate mean and std are now close to 0 and 1. if not, increase normalize_sample.
+    rewards = sampling_rewards()
+    distributed.all_gather_into_tensor(all_rewards, torch.cat(rewards))
+    print(f"after normalization, the mean and std {all_rewards.mean():.4f}, {all_rewards.std():.4f}")
+
 
 def train(config: dict):
-    # FSDP environment variables and setup
-    local_rank = int(os.environ['LOCAL_RANK'])  # rank on local node
-    rank = int(os.environ['RANK'])  # global rank
-    world_size = int(os.environ['WORLD_SIZE'])  # total number of devices
-    setup()
-    torch.cuda.set_device(local_rank)
-    device = torch.cuda.current_device()
-
     set_seed(config['seed'], rank)
-
     if config['wandb_log'] and rank == 0:  # wandb logging
         wandb_project = 'dpo_grpo_rs'
         wandb_run_name = f"{config['model_for']}-{config['model']}-{str(int(time.time()))}"
@@ -45,26 +79,26 @@ def train(config: dict):
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
     # load model
+    extra_parameters = {}
     if config['model_for'] == 'sft':
-        eval_dataset = dataset = TldrCompletion(tokenizer)
+        dataset = TldrCompletion(tokenizer)
         model = Policy(FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, True, device)
     elif config['model_for'] == 'reward':
-        eval_dataset = dataset = TldrPreference(tokenizer)
-        model = Reward(FSDP(get_model(config), **fsdp_dict, device_id=device),
-                       tokenizer, config, trained_reward=False, device=device)
+        sampling_dataset = TldrCompletion(tokenizer)
+        dataset = TldrPreference(tokenizer)
+        # policy is for sampling response to normalize reward
+        policy_ref = Policy(FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, False, device)
+        policy_ref.lm_model.eval()
+        model = Reward(FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, trained_reward=False, device=device)
+
+        extra_parameters = {'lm_head_gain': model.gain, 'lm_head_bias': model.bias}
+        normalize_reward(model, policy_ref, sampling_dataset, tokenizer, config)
+
     elif config['model_for'] == 'dpo':
-        eval_dataset = dataset = TldrPreference(tokenizer)
+        dataset = TldrPreference(tokenizer)
         policy_ref = Policy(FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, False, device)
         policy_ref.lm_model.eval()
         model = DPO(policy_ref, FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, True, device)
-    elif config['model_for'] == 'dpo_rs':  # DPO + rejection sampling
-        dataset = TldrCompletion(tokenizer)
-        eval_dataset = TldrPreference(tokenizer)
-        policy_ref = Policy(FSDP(get_model(config['policy_ref']), **fsdp_dict, device_id=device), tokenizer, config, False, device)
-        policy_ref.lm_model.eval()
-        reward_model = Reward(FSDP(get_model(config['reward_model']), **fsdp_dict, device_id=device), tokenizer, config, trained_reward=True, device=device)
-        reward_model.lm_model.eval()
-        model = RejectionSamplingDPO(reward_model, policy_ref, FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, True, device)
     else:
         raise ValueError(f"Unknown model usage: {config['model_for']}")
 
@@ -80,21 +114,20 @@ def train(config: dict):
 
     local_total, local_batch_size = len(dataset) // world_size, config['batch_size'] // world_size
     best_eval_loss = None
-    optimizer = model.configure_optimizers(config['lr'])
+    optimizer = model.configure_optimizers(
+        itertools.chain(extra_parameters.items(), model.lm_model.named_parameters()), config['lr'])
     scheduler = CosineAnnealingLR(optimizer, T_max=local_total * config['epoch'] // local_batch_size, eta_min=config['min_lr'])
-
-    local_eval_total, local_eval_batch_size = eval_dataset.len_val() // world_size, config['eval_batch_size'] // world_size
-    eval_order = rank * local_eval_total + torch.arange(local_eval_total)
 
     def evaluation(force_save:bool = False):
         model.lm_model.eval()
         eval_losses, eval_metrics = [], defaultdict(list)
-        for k in range(min(100, local_eval_total // local_eval_batch_size)):
-            vidx = eval_order[k * local_eval_batch_size: k * local_eval_batch_size + local_eval_batch_size]
-            eval_input_ids, eval_mask, eval_prompt_length = eval_dataset.get_batch(vidx, train=False)
-            eval_input_ids, eval_mask = eval_input_ids.to(device, dtype=torch.int32), eval_mask.to(device, dtype=torch.int32)
-
-            eval_loss, eval_metric = model.eval_accuracy(eval_input_ids, eval_mask, eval_prompt_length)
+        local_eval_total = config['eval_sample'] // world_size
+        eval_order = rank * dataset.len_val() // world_size + torch.randint(dataset.len_val() // world_size, size=(local_eval_total,))
+        for k in range(local_eval_total // local_batch_size):
+            vidx = eval_order[k * local_batch_size: k * local_batch_size + local_batch_size]
+            eval_input_ids, eval_prompt_length = dataset.get_batch(vidx, train=False)
+            eval_input_ids = eval_input_ids.to(device, dtype=torch.int32)
+            eval_loss, eval_metric = model.eval_accuracy(eval_input_ids, eval_prompt_length)
 
             eval_losses.append(eval_loss)
             for mk, mv in eval_metric.items():
@@ -115,9 +148,9 @@ def train(config: dict):
             best_eval_loss = cur_eval_loss
         elif cur_eval_loss < best_eval_loss:
             best_eval_loss = cur_eval_loss
-            save_model_checkpoint(model.lm_model, rank, config)
+            save_model_checkpoint(model.lm_model, rank, config, extra_parameters)
         elif force_save:
-            save_model_checkpoint(model.lm_model, rank, config)
+            save_model_checkpoint(model.lm_model, rank, config, extra_parameters)
 
         if config['wandb_log'] and rank == 0:
             wandb.log({
@@ -134,26 +167,24 @@ def train(config: dict):
         for j in tqdm(range(local_total // local_batch_size), desc=f"epoch-{epoch} on rank-{rank}"):
             idx = order[j * local_batch_size: j * local_batch_size + local_batch_size]
 
+            # gradient accumulation steps
             micro_batch_size = local_batch_size // config['gradient_step']
             losses, metrics = [], defaultdict(list)
             for j_micro in range(config['gradient_step']):
                 slice_idx = slice(j_micro * micro_batch_size, j_micro * micro_batch_size + micro_batch_size)
-                if config['model_for'] == 'dpo_rs':
-                    input_ids, mask, prompt_length = dataset.get_batch(idx[slice_idx], with_completion=False)
-                    input_ids, mask = input_ids.to(device, dtype=torch.int32), mask.to(device, dtype=torch.int32)
-                    input_ids, mask = model.generate_pairs(input_ids, mask)
-                else:
-                    input_ids, mask, prompt_length = dataset.get_batch(idx[slice_idx])
-                    input_ids, mask = input_ids.to(device, dtype=torch.int32), mask.to(device, dtype=torch.int32)
-
-                loss, metric = model.loss(input_ids, mask, prompt_length)
+                input_ids, prompt_length = dataset.get_batch(idx[slice_idx])
+                input_ids = input_ids.to(device, dtype=torch.int32)
+                loss, metric = model.loss(input_ids, prompt_length)
                 (loss / config['gradient_step']).backward()
                 # preserve micro-batch metrics
                 losses.append(loss.clone().detach())
                 for mk, mv in metric.items():
                     metrics[mk].append(mv)
 
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.lm_model.parameters(), config['max_gradient']).detach()
+            if config['model_for'] == 'reward':
+                distributed.all_reduce(model.gain.grad, op=distributed.ReduceOp.AVG)
+                distributed.all_reduce(model.bias.grad, op=distributed.ReduceOp.AVG)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.lm_model.parameters(), float('inf')).detach()
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()  # release memory right away
@@ -180,8 +211,9 @@ def train(config: dict):
                     })
                 else:
                     print(f"training loss is {fsdp_loss.item():.4f}")
-        # at epoch end
-        evaluation(True)
+
+    # at training end
+    evaluation(True)
 
     distributed.barrier()
     cleanup()
