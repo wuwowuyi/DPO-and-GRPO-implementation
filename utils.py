@@ -43,6 +43,16 @@ def set_seed(seed: int, rank: int):
     np.random.seed(seed)
 
 
+def move_padding_left(tokens, pad_token_id):
+    """
+    Move all padding tokens to the left.
+    """
+    return torch.tensor(
+        [[pad_token_id] * (t == pad_token_id).sum() + [x for x in t if x != pad_token_id] for t in tokens],
+        device=tokens.device
+    )
+
+
 model_ckpt_dir = Path('saved_ckpt')
 model_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
