@@ -122,9 +122,10 @@ def train(config: dict):
         model.lm_model.eval()
         eval_losses, eval_metrics = [], defaultdict(list)
         local_eval_total = config['eval_sample'] // world_size
+        local_eval_batch_size = config['eval_batch_size'] // world_size
         eval_order = rank * dataset.len_val() // world_size + torch.randint(dataset.len_val() // world_size, size=(local_eval_total,))
-        for k in range(local_eval_total // local_batch_size):
-            vidx = eval_order[k * local_batch_size: k * local_batch_size + local_batch_size]
+        for k in range(local_eval_total // local_eval_batch_size):
+            vidx = eval_order[k * local_eval_batch_size: k * local_eval_batch_size + local_eval_batch_size]
             eval_input_ids, eval_prompt_length = dataset.get_batch(vidx, train=False)
             eval_input_ids = eval_input_ids.to(device, dtype=torch.int32)
             eval_loss, eval_metric = model.eval_accuracy(eval_input_ids, eval_prompt_length)

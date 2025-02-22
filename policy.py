@@ -105,13 +105,12 @@ class Policy(LLM):
         """
         mask = (input_ids != self.tokenizer.pad_token_id).int()
         position_ids = (torch.cumsum(mask, 1) - mask)[:, :-1]
-        input_token, attention_mask = input_ids[:, :-1].clone(), mask[:, :-1]
-        logits = self.lm_model(input_token, attention_mask=attention_mask, position_ids=position_ids).logits[:, prompt_length-1:, :]  # shape=(n, response_length, vocab_size)
+        label, input_ids, attention_mask = input_ids[:, prompt_length:], input_ids[:, :-1], mask[:, :-1]
+        logits = self.lm_model(input_ids, attention_mask=attention_mask, position_ids=position_ids).logits[:, prompt_length-1:, :]  # shape=(n, response_length, vocab_size)
 
         if scale:  # scaled by temperature
             logits /= torch.as_tensor(self.config['temperature'], dtype=torch.bfloat16, device=self.device)
 
-        label = input_ids[:, prompt_length:]  # shape=(n, response_length)
         n, response_length = label.shape
         logp = -F.cross_entropy(logits.reshape(n * response_length, -1), label.reshape(-1).long(), reduction='none')  # shape=(n * response_length,)
         logp = logp.reshape(n, response_length) * mask[:, prompt_length:]  # ignore logp on the padding tokens
