@@ -70,7 +70,7 @@ def save_ckpt(model: nn.Module, model_save_name: str):
 # create singleton saving policies to avoid making over and over
 fullstate_save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
 
-def save_model_checkpoint(model, rank, cfg, extra_state_dict):
+def save_model_checkpoint(model, rank, cfg, extra_state_dict=None):
     """saving model via rank0 cpu streaming and full_state_dict"""
 
     # saving with rank0 cpu
@@ -78,6 +78,8 @@ def save_model_checkpoint(model, rank, cfg, extra_state_dict):
         print(f" unable to handle checkpoint type {cfg['checkpoint_type']}, aborting")
 
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, fullstate_save_policy):
+        if extra_state_dict is None:
+            extra_state_dict = {}
         ckpt = {
             'model': model.state_dict(),
             **extra_state_dict
