@@ -2,7 +2,7 @@ model_for: dpo
 model: gpt2
 dtype: bfloat16
 
-ckpt: saved_ckpt/sft_gpt2_fsdp.pt
+ckpt: saved_ckpt/sft_gpt2_fsdp_1740081604_position.pt
 ckpt_type: sft
 
 beta: 0.1
@@ -10,12 +10,19 @@ label_smoothing: 0.0
 
 temperature: 0.7
 batch_size: 32  # to reduce memory footprint
+gradient_step: 2  # gradient accumulation steps
+max_gradient: 1
+
+eval_batch_size: 16
+eval_sample: 128
+
 lr: 0.00001
 min_lr: 0.000001
 epoch: 2
 
-activation_checkpointing: True
 
+
+activation_checkpointing: True
 checkpoint_type: FULL_STATE_DICT # SHARDED_STATE_DICT, or FULL_STATE_DICT
 checkpoint_folder: checkpoint
 model_save_name: dpo_gpt2

@@ -2,16 +2,19 @@ model_for: sft
 model: gpt2-large
 dtype: bfloat16
 
-
+beta: 0.1
+label_smoothing: 0.0
 temperature: 0.7
 
 batch_size: 64
 gradient_step: 2  # gradient accumulation steps
 max_gradient: 1
-lr: 0.00005
-min_lr: 0.000005
+lr: 0.00001
+min_lr: 0.000001
 epoch: 1
+
 eval_batch_size: 32
+eval_sample: 1024
 
 activation_checkpointing: True
 

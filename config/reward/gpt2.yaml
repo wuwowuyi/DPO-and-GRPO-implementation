@@ -2,12 +2,22 @@ model_for: reward
 model: gpt2
 dtype: bfloat16
 
-ckpt: saved_ckpt/sft_gpt2_fsdp.pt
+ckpt: saved_ckpt/sft_gpt2_fsdp_1740081604_position.pt
 ckpt_type: sft
 
-batch_size: 32  # to reduce memory footprint
-lr: 0.00005
-min_lr: 0.000005
+
+temperature: 0.7
+batch_size: 64
+gradient_step: 2  # gradient accumulation steps
+max_gradient: 3  # max gradient norm
+
+eval_batch_size: 32
+
+normalize_sample: 512
+eval_sample: 1024
+
+lr: 0.00001
+min_lr: 0.000001
 epoch: 1
 
 activation_checkpointing: True

@@ -1,9 +1,12 @@
-model_for: reward
+model_for: dpo
 model: gpt2-large
 dtype: bfloat16
 
 ckpt: saved_ckpt/sft_gpt2-large_fsdp_1740093310_position_last.pt
 ckpt_type: sft
+
+beta: 0.1
+label_smoothing: 0.0
 
 temperature: 0.7
 batch_size: 64
@@ -11,19 +14,17 @@ gradient_step: 2  # gradient accumulation steps
 max_gradient: 1  # max gradient norm
 
 eval_batch_size: 32
-
-normalize_sample: 1024
 eval_sample: 1024
 
 lr: 0.0000005
-min_lr: 0.0000002
-epoch: 1
+min_lr: 0.0000001
+epoch: 2
+
 
 activation_checkpointing: True
-
 checkpoint_type: FULL_STATE_DICT # SHARDED_STATE_DICT, or FULL_STATE_DICT
 checkpoint_folder: checkpoint
-model_save_name: reward_gpt2-large
+model_save_name: dpo_gpt2-large
 dist_checkpoint_root_folder: checkpoint
 dist_checkpoint_folder: shard
 save_using_num_threads: 8
