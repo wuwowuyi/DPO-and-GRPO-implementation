@@ -1,0 +1,50 @@
+
+model_for: grpo
+model: gpt2
+dtype: bfloat16
+
+ckpt: saved_ckpt/sft_gpt2_fsdp_1740081604_position.pt
+ckpt_type: sft
+
+batch_size: 32  # to reduce memory footprint
+gradient_step: 4
+lr: 0.00001
+min_lr: 0.000001
+epoch: 1
+
+n_samples: 32
+n_samples_select: 8
+
+temperature: 0.7
+top_p: 0.95
+
+max_response_length: 64
+#noptepochs: 2  # number of ppo iterations
+penalty_reward_value: -1  # if a sampling response has no end token, set its reward to this value
+beta: 0.1
+
+cliprange: 0.2
+kl_coef: 0.03
+
+normalize_sample: 256
+eval_sample: 256
+
+
+activation_checkpointing: True
+
+checkpoint_type: FULL_STATE_DICT # SHARDED_STATE_DICT, or FULL_STATE_DICT
+checkpoint_folder: checkpoint
+model_save_name: reward_gpt2
+dist_checkpoint_root_folder: checkpoint
+dist_checkpoint_folder: shard
+save_using_num_threads: 4
+
+policy_ref:
+  model: gpt2
+  ckpt: saved_ckpt/sft_gpt2_fsdp_1740081604_position.pt
+  ckpt_type: sft
+
+reward_model:
+  model: gpt2
+  ckpt: saved_ckpt/reward_gpt2_fsdp_1740083031_sft.pt
+  ckpt_type: reward

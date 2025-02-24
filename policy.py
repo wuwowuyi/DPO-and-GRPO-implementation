@@ -1,4 +1,5 @@
 import contextlib
+from operator import itemgetter
 
 import numpy as np
 import torch
@@ -8,7 +9,7 @@ from torch.nn import functional as F
 from transformers import GPT2Tokenizer
 
 from gpt2 import model_param
-from utils import move_padding_left
+from utils import move_padding_left, take_top_p_logits
 
 
 class LLM:
@@ -93,7 +94,7 @@ class LLM:
 
 class Policy(LLM):
 
-    def log_prob(self, input_ids, prompt_length: int, avg_seq: bool = True, scale: bool = False):
+    def log_prob(self, input_ids, prompt_length: int, avg_seq: bool = True, scale: bool = False, return_entropy=False, top_p=1.0):
         """
         Compute per token(step) log probability.
 
@@ -111,10 +112,20 @@ class Policy(LLM):
         if scale:  # scaled by temperature
             logits /= torch.as_tensor(self.config['temperature'], dtype=torch.bfloat16, device=self.device)
 
+        if top_p < 1.0:
+            logits = take_top_p_logits(logits, top_p)
+
         n, response_length = label.shape
         logp = -F.cross_entropy(logits.reshape(n * response_length, -1), label.reshape(-1).long(), reduction='none')  # shape=(n * response_length,)
         logp = logp.reshape(n, response_length) * mask[:, prompt_length:]  # ignore logp on the padding tokens
-        return torch.sum(logp, dim=-1) if avg_seq else logp
+
+        entropy = None
+        if return_entropy:
+            p = F.softmax(logits, dim=-1)  # shape=(n, response_length, vocab_size)
+            entropy = torch.logsumexp(logits, dim=-1) - torch.sum(p * logits, dim=-1)  # shape=(n, response_length)
+            entropy = entropy * mask[:, prompt_length]  # ignore padding tokens entropies
+
+        return torch.sum(logp, dim=-1) if avg_seq else logp, entropy
 
     @torch.no_grad()
     def generate(self, prompt, n_samples: int =1, max_response_length: int = 64, return_logp: bool = False):
@@ -138,7 +149,11 @@ class Policy(LLM):
         # FSDP generation according to https://github.com/pytorch/pytorch/issues/100069
         ctx = lambda: (FSDP.summon_full_params(self.lm_model, recurse=False, writeback=False)
                        if self.config['parallel'] == 'FSDP' else contextlib.nullcontext())
-        with ctx():
+
+        extra_params = {'top_p': 1.0 if 'top_p' not in self.config else self.config['top_p'],
+                        'top_k': 0 if 'top_k' not in self.config else self.config['top_k']}
+
+        with ctx(), torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
             outputs = self.lm_model.generate(
                 prompt,
                 attention_mask=(prompt != self.tokenizer.pad_token_id).int(),
@@ -149,16 +164,26 @@ class Policy(LLM):
                 pad_token_id=self.tokenizer.pad_token_id,
                 num_return_sequences=n_samples,
                 return_dict_in_generate=True,
-                output_logits=True
+                output_logits=True,
+                **extra_params
             )
         _, prompt_length = prompt.shape
         responses = outputs.sequences[:, prompt_length:]  # shape=(n * n_samples, response_length)
+
         logps = None
         if return_logp:
             logits = torch.stack(outputs.logits)  # shape=(response_length, n * n_samples, vocab_size)
-            logps = F.log_softmax(logits.transpose(0, 1), dim=-1, dtype=torch.bfloat16)  # shape=(n * n_samples, response_length, vocab_size)
-            logps = torch.gather(logps, -1, responses.unsqueeze(2)).squeeze(2)  # shape=(n * n_samples, response_length)
-        return responses.to(dtype=torch.int32, device=self.device), logps.to(device=self.device) if logps else logps
+            logits = logits.transpose(0, 1)  # shape=(n * n_samples, response_length, vocab_size)
+            logits /= torch.as_tensor(self.config['temperature'], dtype=torch.bfloat16, device=self.device)
+            if extra_params['top_k'] > 0:
+                v, _ = torch.topk(logits, min(extra_params['top_k'], logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')  # use v[:, [-1]] rather than v[:, -1] to keep dims.
+            if extra_params['top_p'] < 1.0:
+                logits = take_top_p_logits(logits, extra_params['top_p'])
+
+            logps = -F.cross_entropy(logits.flatten(0, 1), responses.reshape(-1).long(), reduction='none')  # shape=(n * n_samples * response_length,)
+            logps = logps.reshape(responses.shape)
+        return responses.to(dtype=torch.int32), logps
 
 
 class Reward(LLM):
@@ -187,13 +212,18 @@ class Reward(LLM):
                 self.lm_model.lm_head = nn.Linear(n_embd, 1, bias=False, device=self.device, dtype=torch.bfloat16)
                 torch.nn.init.normal_(self.lm_model.lm_head.weight, std=1 / np.sqrt(n_embd + 1))
 
-            self.gain = torch.nn.Parameter(torch.tensor(1.0, device=self.device, dtype=torch.bfloat16), requires_grad=True)
-            self.bias = torch.nn.Parameter(torch.tensor(0.0, device=self.device, dtype=torch.bfloat16), requires_grad=True)
+        self.gain = torch.nn.Parameter(torch.tensor(1.0, device=self.device, dtype=torch.bfloat16), requires_grad=True)
+        self.bias = torch.nn.Parameter(torch.tensor(0.0, device=self.device, dtype=torch.bfloat16), requires_grad=True)
+
+    def eval(self):
+        self.lm_model.eval()
+        self.gain.requires_grad_(False)
+        self.bias.requires_grad_(False)
 
     @torch.no_grad()
-    def set_gain_bias(self, mean, std) -> None:
+    def compute_gain_bias(self, mean, std):
         """
-        Compute and set gain and bias given current mean ans std, to get target mean 0 and std 1.
+        Compute gain and bias given current mean and std, to get target mean 0 and std 1.
 
         :param mean: current mean
         :param std: current std
@@ -203,6 +233,10 @@ class Reward(LLM):
         target_std = torch.tensor(1.0, dtype=std.dtype, device=self.device)
         gain = target_std / std
         bias = target_mean - gain * mean
+        return gain, bias
+
+    @torch.no_grad()
+    def set_gain_bias(self, gain, bias):
         print(f"set gain and bias to {gain:.4f} and {bias:.4f}")
         self.gain.copy_(gain)
         self.bias.copy_(bias)
@@ -211,13 +245,12 @@ class Reward(LLM):
         """
         input_ids = prompt + response, to compute reward of the entire sequence
 
-        Note: ALL paddings tokens are on the left!
-
         :param input_ids: shape=(n, sequence_length)
         :return: rewards. shape=(n,)
         """
         # important for GPT2. ALL padding on left otherwise this is wrong.
-        # All the padding tokens have position id 0, and the sequence is 0, 1, ...
+        # All the padding tokens have position id 0, and the rest is 0, 1, ...
+        input_ids = move_padding_left(input_ids, self.tokenizer.pad_token_id)
         mask = (input_ids != self.tokenizer.pad_token_id).int()
         position_ids = torch.cumsum(mask, dim=1) - mask
 
@@ -232,7 +265,6 @@ class Reward(LLM):
         return loss
 
     def loss(self, input_ids, prompt_length, **kwargs):
-        input_ids = move_padding_left(input_ids, self.tokenizer.pad_token_id)
         rewards = self.compute_reward(input_ids)  # shape=(n, )
         loss = self._compute_loss(rewards)
         k = rewards.shape[0] // 2
@@ -246,7 +278,6 @@ class Reward(LLM):
 
     @torch.no_grad()
     def eval_accuracy(self, input_ids, prompt_length):
-        input_ids = move_padding_left(input_ids, self.tokenizer.pad_token_id)
         rewards = self.compute_reward(input_ids)  # shape=(n, )
         loss = self._compute_loss(rewards)
         k = rewards.shape[0] // 2
@@ -293,8 +324,8 @@ class DPO(Policy):
 
     def loss(self, input_ids, prompt_length, **kwargs):
         with torch.no_grad():
-            logp_ref = self.policy_ref.log_prob(input_ids, prompt_length)
-        logp = self.log_prob(input_ids, prompt_length)
+            logp_ref, _ = self.policy_ref.log_prob(input_ids, prompt_length)
+        logp, _ = self.log_prob(input_ids, prompt_length)
 
         loss, reward_w, reward_l = self._compute_loss_reward(logp, logp_ref)
         return loss, {
@@ -305,8 +336,8 @@ class DPO(Policy):
 
     @torch.no_grad()
     def eval_accuracy(self, input_ids, prompt_length):
-        logp_ref = self.policy_ref.log_prob(input_ids, prompt_length)
-        logp = self.log_prob(input_ids, prompt_length)
+        logp_ref, _ = self.policy_ref.log_prob(input_ids, prompt_length)
+        logp, _ = self.log_prob(input_ids, prompt_length)
 
         loss, reward_w, reward_l = self._compute_loss_reward(logp, logp_ref)
         return loss, {
@@ -314,3 +345,162 @@ class DPO(Policy):
             f"reward/{self.config['model_for']}_eval_rejected": reward_l.mean(),
             f"reward/{self.config['model_for']}_eval_acc": (reward_w > reward_l).float().mean()
         }
+
+
+class GRPO(Policy):
+    """
+    GRPO algorithm in the DeepSeekMath paper https://arxiv.org/abs/2402.03300.
+    """
+
+    def __init__(
+            self,
+            reward_model: Reward,
+            policy_ref: Policy,
+            lm_model,  # language model
+            tokenizer: GPT2Tokenizer,
+            config: dict,
+            train: bool = True,
+            device: int = 0  # index of current device
+    ):
+        super().__init__(lm_model, tokenizer, config, train, device)
+        self.reward_model = reward_model
+        self.policy_ref = policy_ref  # reference policy
+        self.truncate_tokens = [self.tokenizer.encode('\n')[0], self.tokenizer.eos_token_id]  # '\n' is 198
+
+    def kl_divergence(self, logp, logp_ref):
+        if torch.allclose(logp, logp_ref):
+            return torch.zeros_like(logp)
+        else:
+            kl = torch.exp(logp_ref - logp) - (logp_ref - logp) - 1
+            #assert kl >= 0, "kl-divergence is non-negative"
+            return kl
+
+    def _post_process(self, responses):
+        """applied to responses before computing a reward.
+        Set all tokens after the truncate token to padding token.
+
+        responses.shape=(n, response_length)
+        """
+        masks = []
+        for t in self.truncate_tokens:
+            masks.append(torch.eq(responses, t).int())  # like 0, 0, ..., 1, 0, ...0, 1, 0,..
+        mask = torch.maximum(*masks)  # set any truncate token match to 1
+        mask = torch.cumsum(mask, dim=1) - mask  # all 0 before and at the first truncate token, all 1 after.
+        processed = torch.where(mask.bool(), self.tokenizer.pad_token_id, responses)
+        return processed
+
+    def _filter_response(self, responses):
+        masks = []
+        for t in self.truncate_tokens:
+            masks.append(torch.eq(responses, t).int())  # like 0, 0, ..., 1, 0, ...0, 1, 0,..
+        mask = torch.maximum(*masks)
+        return torch.any(mask, dim=1)
+
+    @torch.no_grad()
+    def compute_rewards(self, prompt, responses, n_samples: int):
+        # post process responses
+        processed = self._post_process(responses)
+        # call reward_model to compute rewards
+        reward_input = torch.cat((prompt, processed), dim=1)  # prompt left padded, response right padded.
+        raw_rewards = self.reward_model.compute_reward(reward_input)  # shape=(n * n_samples,)
+        # normalize rewards per group
+        rewards = torch.stack(torch.split(raw_rewards, n_samples))  # shape=(n, n_samples)
+        group_mean, group_std = rewards.mean(dim=1, keepdim=True), rewards.std(dim=1, keepdim=True)
+        rewards = ((rewards - group_mean) / group_std).reshape(-1)  # shape=(n * n_samples,)
+        # penalize reward
+        valid_mask = self._filter_response(responses)  # shape=(n * n_samples,)
+        rewards = torch.where(valid_mask, rewards, self.config['penalty_reward_value'])  # shape=(n * n_samples,)
+        return rewards
+
+    def rejection_sampling(self, responses, rewards, logps, beta=0.1):
+        """
+        Algorithm 1 (conduct_rejection_sampling function) from paper https://arxiv.org/abs/2309.06657.
+
+        responses: responses to a prompt
+        rewards: rewards of these responses, in the same order as responses
+        num_samples: number to select
+        beta: beta parameter in KL-constrained reward maximization objective
+
+        return accepted sample responses and their rewards
+        """
+        candidates = {c: (r, logp) for c, r, logp in zip(torch.unbind(responses), torch.unbind(rewards), torch.unbind(logps))}
+        accepted = []
+        while len(accepted) < self.config['n_samples_select']:
+            max_reward = max(candidates.values(), key=itemgetter(0))[0]
+            to_remove = []
+            for c, (r, logp) in candidates.items():
+                u = torch.rand(1, dtype=torch.bfloat16, device=self.device)
+                if u >= torch.exp((r - max_reward) / beta):  # todo: range of right side value?
+                    continue
+                accepted.append((c, r, logp))
+                to_remove.append(c)
+                if len(accepted) == self.config['n_samples_select']:
+                    break
+            for c in to_remove:
+                candidates.pop(c)
+
+        return (torch.stack([t[0] for t in accepted]),
+                torch.stack([t[1] for t in accepted]),
+                torch.stack([t[2] for t in accepted]),
+                )
+
+    @torch.no_grad()
+    def generate_rollouts(self, prompt):
+        """
+        Generate a number of responses, rewards, logps for given prompts.
+
+        :param prompt: left padded!  shape=(n, prompt_length)
+        """
+        if prompt.dim() == 1:
+            prompt = prompt.view(1, -1)
+        n, prompt_length = prompt.shape
+
+        # first, sampling responses
+        # responses.shape = logps.shape =(n * n_samples, response_length)
+        n_samples = self.config['n_samples']
+        responses, logps = self.generate(prompt, n_samples, return_logp=True)
+
+        # second, compute rewards
+        tiled_prompt = prompt.tile((1, n_samples)).reshape(n * n_samples, -1)  # shape=(n * n_samples, prompt_length)
+        rewards = self.compute_rewards(tiled_prompt, responses, n_samples)
+
+        responses, rewards, logps = self.rejection_sampling(responses, rewards, logps)
+
+        # third, compute reference policy's log probs.
+        # compute log prob of reference policy
+        # input_ids = torch.cat((tiled_prompt, responses), dim=1)  # do not use post processed responses
+        # logp_ref, _ = self.policy_ref.log_prob(input_ids, prompt_length, avg_seq=False, scale=True)[:,
+        #            prompt_length - 1:]  # shape=(n * n_samples, response_length)
+
+        return {
+            'responses': responses,  # shape=(n * n_samples, response_length)
+            'rewards': rewards.unsqueeze(1),  # shape=(n * n_samples, 1)
+            'logp': logps,  # current iteration policy log probs. shape=(n * n_samples, response_length)
+          #  'logp_ref': logp_ref  # reference policy log probs. shape=(n * n_samples, response_length)
+        }
+
+    def compute_loss(self, prompts, responses, rewards, old_logps, prompt_length):
+        with torch.no_grad():
+            logp_ref, _ = self.policy_ref.log_prob(torch.cat((prompts, responses), dim=1), prompt_length,
+                                        avg_seq=False, scale=True, top_p=self.config['top_p'])
+        logp, entropy = self.log_prob(torch.cat((prompts, responses), dim=1), prompt_length,
+                                      avg_seq=False, scale=True, return_entropy=True, top_p=self.config['top_p'])
+
+        ratio = torch.exp(logp - old_logps)
+
+        rewards = rewards.expand_as(ratio)  # expand to (n * n_samples, response_length)
+        #rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+        pg_gain = rewards * ratio
+        pg_gain_clipped = rewards * torch.clamp(ratio, 1.0 - self.config['cliprange'], 1.0 + self.config['cliprange'])
+        pg_gain_min = torch.minimum(pg_gain, pg_gain_clipped)  # true whether reward is positive or negative
+        kl = self.kl_divergence(logp, logp_ref)
+        loss = torch.sum(self.config['kl_coef'] * kl - pg_gain_min)
+        return (loss,
+                {'grpo/kl_penalty': torch.mean(kl),
+                 'grpo/entropy': torch.mean(entropy),
+                 'grpo/pg_loss': -torch.mean(pg_gain_min),
+                 'grpo/rewards_mean': torch.mean(rewards),
+                 'grpo/rewards_std': torch.std(rewards),
+                 'grpo/ratio_mean': torch.mean(ratio)
+                 })
+
