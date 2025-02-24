@@ -43,15 +43,17 @@ def train(config: dict):
 
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
     tokenizer.pad_token_id = tokenizer.eos_token_id
+    dataset_dict = {'max_prompt_length': config['max_prompt_length'],
+                    'max_response_length': config['max_response_length']}
 
     # load model
     extra_parameters = {}
     if config['model_for'] == 'sft':
-        dataset = TldrCompletion(tokenizer)
+        dataset = TldrCompletion(tokenizer, **dataset_dict)
         model = Policy(FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, True, device)
     elif config['model_for'] == 'reward':
-        sampling_dataset = TldrCompletion(tokenizer)
-        dataset = TldrPreference(tokenizer)
+        sampling_dataset = TldrCompletion(tokenizer, **dataset_dict)
+        dataset = TldrPreference(tokenizer, **dataset_dict)
         # policy is for sampling response to normalize reward
         policy_ref = Policy(FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, False, device)
         policy_ref.lm_model.eval()
@@ -61,7 +63,7 @@ def train(config: dict):
         normalize_reward(model, policy_ref, sampling_dataset, config)
 
     elif config['model_for'] == 'dpo':
-        dataset = TldrPreference(tokenizer)
+        dataset = TldrPreference(tokenizer, **dataset_dict)
         policy_ref = Policy(FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, False, device)
         policy_ref.lm_model.eval()
         model = DPO(policy_ref, FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, True, device)
@@ -84,7 +86,7 @@ def train(config: dict):
         itertools.chain(extra_parameters.items(), model.lm_model.named_parameters()), config['lr'])
     scheduler = CosineAnnealingLR(optimizer, T_max=local_total * config['epoch'] // local_batch_size, eta_min=config['min_lr'])
 
-    def evaluation(force_save:bool = False):
+    def evaluation(current_step: int, force_save:bool = False):
         model.lm_model.eval()
         eval_losses, eval_metrics = [], defaultdict(list)
         local_eval_total = config['eval_sample'] // world_size
@@ -111,13 +113,14 @@ def train(config: dict):
             eval_metrics[mk] = mv
 
         nonlocal best_eval_loss
+        to_save_dict = {**extra_parameters, 'step': current_step}
         if best_eval_loss is None:
             best_eval_loss = cur_eval_loss
         elif cur_eval_loss < best_eval_loss:
             best_eval_loss = cur_eval_loss
-            save_model_checkpoint(model.lm_model, rank, config, extra_parameters)
+            save_model_checkpoint(model.lm_model, rank, config, to_save_dict)
         elif force_save:
-            save_model_checkpoint(model.lm_model, rank, config, extra_parameters)
+            save_model_checkpoint(model.lm_model, rank, config, to_save_dict)
 
         if config['wandb_log'] and rank == 0:
             wandb.log({
@@ -157,7 +160,7 @@ def train(config: dict):
             optimizer.zero_grad()  # release memory right away
 
             if j % eval_interval == 0:
-                evaluation()
+                evaluation(epoch * local_total // local_batch_size + j)
 
             # sync metrics. change happens in-place
             distributed.all_reduce(grad_norm, op=distributed.ReduceOp.AVG)
@@ -180,7 +183,7 @@ def train(config: dict):
                     print(f"training loss is {fsdp_loss.item():.4f}")
 
     # at training end
-    evaluation(True)
+    evaluation(config['epoch'] * local_total // local_batch_size, True)
 
     distributed.barrier()
     cleanup()

@@ -9,7 +9,8 @@ Path(dataset_cache).mkdir(parents=True, exist_ok=True)
 
 
 class TldrDataset:
-    def __init__(self, name: str, tokenizer, max_prompt_length: int = 512, max_response_length: int = 64):
+    def __init__(self, name: str, tokenizer, max_prompt_length, max_response_length):
+        print(f"loading dataset {name}, max_prompt_length {max_prompt_length}, max_response_length {max_response_length}")
         self.train = load_dataset(name, split='train', cache_dir=dataset_cache)
         self.val = load_dataset(name, split='validation', cache_dir=dataset_cache)
         self.tokenizer = tokenizer
@@ -55,8 +56,8 @@ class TldrCompletion(TldrDataset):
     """Dataset https://huggingface.co/datasets/trl-lib/tldr
     """
 
-    def __init__(self, tokenizer):
-        super().__init__('trl-lib/tldr', tokenizer)
+    def __init__(self, tokenizer, max_prompt_length: int = 512, max_response_length: int = 64):
+        super().__init__('trl-lib/tldr', tokenizer, max_prompt_length, max_response_length)
 
     def get_batch(self, idx: torch.Tensor, train: bool = True, with_completion: bool = True) -> tuple[torch.Tensor, int]:
         items = self.train[idx] if train else self.val[idx]
@@ -87,8 +88,8 @@ class TldrCompletion(TldrDataset):
 class TldrPreference(TldrDataset):
     """Dataset https://huggingface.co/datasets/trl-lib/tldr-preference"""
 
-    def __init__(self, tokenizer):
-        super().__init__('trl-lib/tldr-preference', tokenizer)
+    def __init__(self, tokenizer, max_prompt_length: int = 512, max_response_length: int = 64):
+        super().__init__('trl-lib/tldr-preference', tokenizer, max_prompt_length, max_response_length)
 
     def get_batch(self, idx: torch.Tensor, train: bool = True) -> tuple[torch.Tensor, int]:
         """
