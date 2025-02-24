@@ -1,14 +1,24 @@
 import functools
+import os
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch import nn, distributed
-from torch.distributed.fsdp import MixedPrecision, StateDictType, FullStateDictConfig
+from torch.distributed.fsdp import MixedPrecision, StateDictType, FullStateDictConfig, CPUOffload
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.nn import functional as F
+
+
+local_rank = int(os.environ['LOCAL_RANK'])
+rank = int(os.environ['RANK'])  # global rank
+world_size = int(os.environ['WORLD_SIZE'])  # total number of devices
+torch.cuda.set_device(local_rank)
+device = torch.cuda.current_device()
+
 
 def setup():
     # initialize the process group
@@ -36,6 +46,13 @@ fsdp_dict = {
     'use_orig_params': True  # otherwise optimizer configure parameter won't work
 }
 
+fsdp_dict_eval = {
+    'auto_wrap_policy': functools.partial(transformer_auto_wrap_policy, transformer_layer_cls={GPT2Block}),
+    'mixed_precision': bfSixteen,
+    #'use_orig_params': True,  # otherwise optimizer configure parameter won't work
+    'cpu_offload': CPUOffload(offload_params=True)
+}
+
 
 def set_seed(seed: int, rank: int):
     seed = 100003 * rank + seed  # different seed on each rank
@@ -51,6 +68,52 @@ def move_padding_left(tokens, pad_token_id):
         [[pad_token_id] * (t == pad_token_id).sum() + [x for x in t if x != pad_token_id] for t in tokens],
         device=tokens.device
     )
+
+def take_top_p_logits(logits: torch.Tensor, p: float):
+    """Nucleus sampling.
+    The implementation here is to find the minimum logits and use them to filter.
+    """
+    sorted_logits = torch.sort(logits, descending=True, dim=-1)[0]
+    probs = F.softmax(sorted_logits, dim=-1)
+    cum_probs = torch.cumsum(probs, dim=-1)
+    mask = torch.cumsum(cum_probs >= p, dim=-1) <= 1
+    selected = torch.where(mask, sorted_logits, float('inf'))
+    min_logits = torch.min(selected, dim=-1, keepdim=True)[0]
+    return torch.where(logits >= min_logits, logits, -float('inf'))
+
+
+def normalize_reward(reward_model, policy, sampling_dataset, config):
+    """
+    Set reward model gain and bias to get reward mean 0 and std 1.
+    """
+    @torch.no_grad()
+    def sampling_rewards():
+        rewards = []
+        sample_order = rank * local_total + torch.randint(local_total, size=(sample_local_total,))
+        for si in range(sample_local_total // local_batch_size):
+            sample_idx = slice(si * local_batch_size, si * local_batch_size + local_batch_size)
+            prompt_ids, _ = sampling_dataset.get_batch(sample_order[sample_idx], with_completion=False)
+            prompt_ids = prompt_ids.to(device, dtype=torch.int32)
+            responses, _ = policy.generate(prompt_ids)
+            input_ids = torch.cat((prompt_ids, responses), dim=1)
+            rewards.append(reward_model.compute_reward(input_ids))
+        return rewards
+
+    sample_total = config['normalize_sample']
+    sample_local_total, local_batch_size = sample_total // world_size, config['batch_size'] // world_size
+    local_total = len(sampling_dataset) // world_size
+
+    # compute rewards mean and std to set gain and bias
+    rewards = sampling_rewards()
+    all_rewards = torch.zeros(sample_total, dtype=rewards[0].dtype, device=device)
+    distributed.all_gather_into_tensor(all_rewards, torch.cat(rewards))
+    gain, bias = reward_model.compute_gain_bias(all_rewards.mean(), all_rewards.std())
+    reward_model.set_gain_bias(gain, bias)
+
+    # validate mean and std are now close to 0 and 1. if not, increase normalize_sample.
+    rewards = sampling_rewards()
+    distributed.all_gather_into_tensor(all_rewards, torch.cat(rewards))
+    print(f"after normalization, the mean and std {all_rewards.mean():.4f}, {all_rewards.std():.4f}")
 
 
 model_ckpt_dir = Path('saved_ckpt')

@@ -1,5 +1,4 @@
 import argparse
-import itertools
 import os
 import sys
 import time
@@ -7,23 +6,23 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
-import wandb
 import yaml
 from torch import distributed
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     apply_activation_checkpointing
 )
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, CPUOffload
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 from transformers import GPT2Tokenizer
 
+import wandb
 from gpt2 import get_model
-from policy import Policy, Reward, DPO
-from tldr_dataset import TldrCompletion, TldrPreference
-from utils import setup, cleanup, check_fn, fsdp_dict, set_seed, save_model_checkpoint, normalize_reward
+from policy import Policy, Reward, GRPO
+from tldr_dataset import TldrCompletion
+from utils import setup, cleanup, check_fn, fsdp_dict, set_seed, save_model_checkpoint, fsdp_dict_eval, normalize_reward
 
-'''Train models on multiple GPUs using FSDP. '''
+'''Train GRPO on multiple GPUs using FSDP. '''
 
 # FSDP environment variables and setup
 local_rank = int(os.environ['LOCAL_RANK'])  # rank on local node
@@ -32,41 +31,36 @@ world_size = int(os.environ['WORLD_SIZE'])  # total number of devices
 torch.cuda.set_device(local_rank)
 device = torch.cuda.current_device()
 
+
 def train(config: dict):
     setup()
 
     set_seed(config['seed'], rank)
     if config['wandb_log'] and rank == 0:  # wandb logging
-        wandb_project = 'dpo_grpo_rs'
+        wandb_project = 'grpo'
         wandb_run_name = f"{config['model_for']}-{config['model']}-{str(int(time.time()))}"
         wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
+    dataset = TldrCompletion(tokenizer)
+
     # load model
-    extra_parameters = {}
-    if config['model_for'] == 'sft':
-        dataset = TldrCompletion(tokenizer)
-        model = Policy(FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, True, device)
-    elif config['model_for'] == 'reward':
-        sampling_dataset = TldrCompletion(tokenizer)
-        dataset = TldrPreference(tokenizer)
-        # policy is for sampling response to normalize reward
-        policy_ref = Policy(FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, False, device)
-        policy_ref.lm_model.eval()
-        model = Reward(FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, trained_reward=False, device=device)
+    policy_ref = Policy(FSDP(get_model(config['policy_ref']), **fsdp_dict_eval, device_id=device),
+                        tokenizer, config, False, device)
+    policy_ref.lm_model.eval()
 
-        extra_parameters = {'lm_head_gain': model.gain, 'lm_head_bias': model.bias}
-        normalize_reward(model, policy_ref, sampling_dataset, config)
+    trained_reward = get_model(config['reward_model'])
+    reward_model = Reward(FSDP(trained_reward, **fsdp_dict_eval, device_id=device),
+                          tokenizer, config, trained_reward=True, device=device)
+    #reward_model.set_gain_bias(ckpt['lm_head_gain'].data, ckpt['lm_head_bias'].data)  # consistent with saving ckpt
+    reward_model.eval()
 
-    elif config['model_for'] == 'dpo':
-        dataset = TldrPreference(tokenizer)
-        policy_ref = Policy(FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, False, device)
-        policy_ref.lm_model.eval()
-        model = DPO(policy_ref, FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, True, device)
-    else:
-        raise ValueError(f"Unknown model usage: {config['model_for']}")
+    model = GRPO(reward_model, policy_ref, FSDP(get_model(config), **fsdp_dict, device_id=device),
+                 tokenizer, config, True, device)
+
+    normalize_reward(reward_model, model, dataset, config)
 
     if 'activation_checkpointing' in config and config['activation_checkpointing']:
         apply_activation_checkpointing(model.lm_model, check_fn=check_fn)
@@ -80,18 +74,16 @@ def train(config: dict):
 
     local_total, local_batch_size = len(dataset) // world_size, config['batch_size'] // world_size
     best_eval_loss = None
-    optimizer = model.configure_optimizers(
-        itertools.chain(extra_parameters.items(), model.lm_model.named_parameters()), config['lr'])
+    optimizer = model.configure_optimizers(model.lm_model.named_parameters(), config['lr'])
     scheduler = CosineAnnealingLR(optimizer, T_max=local_total * config['epoch'] // local_batch_size, eta_min=config['min_lr'])
 
-    def evaluation(force_save:bool = False):
+    def evaluation(force_save: bool = False):
         model.lm_model.eval()
         eval_losses, eval_metrics = [], defaultdict(list)
         local_eval_total = config['eval_sample'] // world_size
-        local_eval_batch_size = config['eval_batch_size'] // world_size
         eval_order = rank * dataset.len_val() // world_size + torch.randint(dataset.len_val() // world_size, size=(local_eval_total,))
-        for k in range(local_eval_total // local_eval_batch_size):
-            vidx = eval_order[k * local_eval_batch_size: k * local_eval_batch_size + local_eval_batch_size]
+        for k in range(local_eval_total // local_batch_size):
+            vidx = eval_order[k * local_batch_size: k * local_batch_size + local_batch_size]
             eval_input_ids, eval_prompt_length = dataset.get_batch(vidx, train=False)
             eval_input_ids = eval_input_ids.to(device, dtype=torch.int32)
             eval_loss, eval_metric = model.eval_accuracy(eval_input_ids, eval_prompt_length)
@@ -115,9 +107,9 @@ def train(config: dict):
             best_eval_loss = cur_eval_loss
         elif cur_eval_loss < best_eval_loss:
             best_eval_loss = cur_eval_loss
-            save_model_checkpoint(model.lm_model, rank, config, extra_parameters)
+            save_model_checkpoint(model.lm_model, rank, config)
         elif force_save:
-            save_model_checkpoint(model.lm_model, rank, config, extra_parameters)
+            save_model_checkpoint(model.lm_model, rank, config)
 
         if config['wandb_log'] and rank == 0:
             wandb.log({
@@ -133,34 +125,50 @@ def train(config: dict):
         order = rank * local_total + torch.randperm(local_total)
         for j in tqdm(range(local_total // local_batch_size), desc=f"epoch-{epoch} on rank-{rank}"):
             idx = order[j * local_batch_size: j * local_batch_size + local_batch_size]
+            prompts, prompt_length = dataset.get_batch(idx, with_completion=False)
+            prompts = prompts.to(device, dtype=torch.int32)
+
+            rollouts = defaultdict(list)
+            for p in prompts:
+                for k, v in model.generate_rollouts(p).items():
+                    rollouts[k].extend(v)
+
+            for k, v in rollouts.items():
+                rollouts[k] = torch.stack(v)
+
+            # normalize rewards
+            r_mean, r_std = rollouts['rewards'].mean(), rollouts['rewards'].std()
+            rollouts['rewards'] -= r_mean
+            rollouts['rewards'] /= r_std
 
             # gradient accumulation steps
-            micro_batch_size = local_batch_size // config['gradient_step']
+            micro_batch_size = local_batch_size * config['n_samples_select'] // config['gradient_step']
             losses, metrics = [], defaultdict(list)
             for j_micro in range(config['gradient_step']):
-                slice_idx = slice(j_micro * micro_batch_size, j_micro * micro_batch_size + micro_batch_size)
-                input_ids, prompt_length = dataset.get_batch(idx[slice_idx])
-                input_ids = input_ids.to(device, dtype=torch.int32)
-                loss, metric = model.loss(input_ids, prompt_length)
+                start, stop = j_micro * micro_batch_size, j_micro * micro_batch_size + micro_batch_size
+                slice_idx = slice(start, stop)
+                responses = rollouts['responses'][slice_idx]
+                logps = rollouts['logp'][slice_idx]
+                rewards = rollouts['rewards'][slice_idx]
+                queries = prompts[[v // config['n_samples_select'] for v in range(start, stop)]]
+
+                loss, metric = model.compute_loss(queries, responses, rewards, logps, prompt_length)
+
                 (loss / config['gradient_step']).backward()
                 # preserve micro-batch metrics
                 losses.append(loss.clone().detach())
                 for mk, mv in metric.items():
                     metrics[mk].append(mv)
 
-            if config['model_for'] == 'reward':
-                distributed.all_reduce(model.gain.grad, op=distributed.ReduceOp.AVG)
-                distributed.all_reduce(model.bias.grad, op=distributed.ReduceOp.AVG)
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.lm_model.parameters(), float('inf')).detach()
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()  # release memory right away
 
             if j % eval_interval == 0:
-                evaluation()
+                #evaluation()
+                ...
 
             # sync metrics. change happens in-place
-            distributed.all_reduce(grad_norm, op=distributed.ReduceOp.AVG)
             fsdp_loss = torch.stack(losses).mean()
             distributed.all_reduce(fsdp_loss, op=distributed.ReduceOp.AVG)
             for mk, mv in metrics.items():
@@ -173,7 +181,6 @@ def train(config: dict):
                     wandb.log({
                         f"loss/{config['model_for']}_train": fsdp_loss,
                         f"lr/{config['model_for']}": scheduler.get_last_lr()[0],
-                        f"grad_norm/{config['model_for']}": grad_norm,
                         **metrics
                     })
                 else:
