@@ -123,7 +123,7 @@ class Policy(LLM):
         if return_entropy:
             p = F.softmax(logits, dim=-1)  # shape=(n, response_length, vocab_size)
             entropy = torch.logsumexp(logits, dim=-1) - torch.sum(p * logits, dim=-1)  # shape=(n, response_length)
-            entropy = entropy * mask[:, prompt_length]  # ignore padding tokens entropies
+            entropy = entropy * mask[:, prompt_length:]  # ignore padding tokens entropies
 
         return torch.sum(logp, dim=-1) if avg_seq else logp, entropy
 
@@ -501,6 +501,7 @@ class GRPO(Policy):
                  'grpo/pg_loss': -torch.mean(pg_gain_min),
                  'grpo/rewards_mean': torch.mean(rewards),
                  'grpo/rewards_std': torch.std(rewards),
-                 'grpo/ratio_mean': torch.mean(ratio)
+                 'grpo/ratio_max': ratio.max(),
+                 'grpo/ratio_min': ratio.min(),
                  })
 
