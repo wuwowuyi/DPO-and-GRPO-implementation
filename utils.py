@@ -100,7 +100,8 @@ def normalize_reward(reward_model, policy, sampling_dataset, config):
         return rewards
 
     sample_total = config['normalize_sample']
-    sample_local_total, local_batch_size = sample_total // world_size, config['batch_size'] // world_size
+    batch_size = config['normalize_batch_size'] if 'normalize_batch_size' in config else config['batch_size']
+    sample_local_total, local_batch_size = sample_total // world_size, batch_size // world_size
     local_total = len(sampling_dataset) // world_size
 
     # compute rewards mean and std to set gain and bias
@@ -140,15 +141,17 @@ def save_model_checkpoint(model, rank, cfg, extra_state_dict=None):
     if not cfg['checkpoint_type'] == 'FULL_STATE_DICT':
         print(f" unable to handle checkpoint type {cfg['checkpoint_type']}, aborting")
 
+    if extra_state_dict is None:
+        extra_state_dict = {}
+    step = extra_state_dict.pop('step', '')
+
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, fullstate_save_policy):
-        if extra_state_dict is None:
-            extra_state_dict = {}
         ckpt = {
             'model': model.state_dict(),
             **extra_state_dict
         }
     if rank == 0:
-        save_name = f"{cfg['model_for']}_{cfg['model']}_fsdp_{str(int(time.time()))}.pt"
+        save_name = f"{cfg['model_for']}_{cfg['model']}_fsdp_{step}_{str(int(time.time()))}.pt"
         print(f"--> saving model {save_name} ...")
         torch.save(ckpt, model_ckpt_dir / save_name)
 
