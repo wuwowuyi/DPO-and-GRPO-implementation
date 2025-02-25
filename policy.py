@@ -127,6 +127,20 @@ class Policy(LLM):
 
         return torch.sum(logp, dim=-1) if avg_seq else logp, entropy
 
+    def compute_loss_reward(self, logp, logp_ref):
+        b = logp.shape[0] // 2
+        # win_idx: index of prompt + chosen response.
+        # lose_idx: index of prompt + rejected response.
+        win_idx, lose_idx = torch.arange(b, device=self.device), torch.arange(b, 2 * b, device=self.device)
+        logp_ref_w, logp_ref_l = logp_ref[win_idx], logp_ref[lose_idx]
+        logp_w, logp_l = logp[win_idx], logp[lose_idx]
+        loss_logits = (logp_w - logp_l) - (logp_ref_w - logp_ref_l)
+        beta, label_smoothing = self.config['beta'], self.config['label_smoothing']
+        loss = -F.logsigmoid(beta * loss_logits) * (1 - label_smoothing) - F.logsigmoid(-beta * loss_logits) * label_smoothing
+        reward_w = beta * (logp_w.detach() - logp_ref_w)
+        reward_l = beta * (logp_l.detach() - logp_ref_l)
+        return loss.mean(), reward_w, reward_l
+
     @torch.no_grad()
     def generate(self, prompt, n_samples: int =1, max_response_length: int = 64, return_logp: bool = False):
         """
@@ -308,26 +322,12 @@ class DPO(Policy):
         super().__init__(lm_model, tokenizer, config, train, device)
         self.policy_ref = policy_ref
 
-    def _compute_loss_reward(self, logp, logp_ref):
-        b = logp.shape[0] // 2
-        # win_idx: index of prompt + chosen response.
-        # lose_idx: index of prompt + rejected response.
-        win_idx, lose_idx = torch.arange(b, device=self.device), torch.arange(b, 2 * b, device=self.device)
-        logp_ref_w, logp_ref_l = logp_ref[win_idx], logp_ref[lose_idx]
-        logp_w, logp_l = logp[win_idx], logp[lose_idx]
-        loss_logits = (logp_w - logp_l) - (logp_ref_w - logp_ref_l)
-        beta, label_smoothing = self.config['beta'], self.config['label_smoothing']
-        loss = -F.logsigmoid(beta * loss_logits) * (1 - label_smoothing) - F.logsigmoid(-beta * loss_logits) * label_smoothing
-        reward_w = beta * (logp_w.detach() - logp_ref_w)
-        reward_l = beta * (logp_l.detach() - logp_ref_l)
-        return loss.mean(), reward_w, reward_l
-
     def loss(self, input_ids, prompt_length, **kwargs):
         with torch.no_grad():
             logp_ref, _ = self.policy_ref.log_prob(input_ids, prompt_length)
         logp, _ = self.log_prob(input_ids, prompt_length)
 
-        loss, reward_w, reward_l = self._compute_loss_reward(logp, logp_ref)
+        loss, reward_w, reward_l = self.compute_loss_reward(logp, logp_ref)
         return loss, {
             f"reward/{self.config['model_for']}_train_chosen": reward_w.mean(),
             f"reward/{self.config['model_for']}_train_rejected": reward_l.mean(),
@@ -339,7 +339,7 @@ class DPO(Policy):
         logp_ref, _ = self.policy_ref.log_prob(input_ids, prompt_length)
         logp, _ = self.log_prob(input_ids, prompt_length)
 
-        loss, reward_w, reward_l = self._compute_loss_reward(logp, logp_ref)
+        loss, reward_w, reward_l = self.compute_loss_reward(logp, logp_ref)
         return loss, {
             f"reward/{self.config['model_for']}_eval_chosen": reward_w.mean(),
             f"reward/{self.config['model_for']}_eval_rejected": reward_l.mean(),
@@ -404,13 +404,13 @@ class GRPO(Policy):
         reward_input = torch.cat((prompt, processed), dim=1)  # prompt left padded, response right padded.
         raw_rewards = self.reward_model.compute_reward(reward_input)  # shape=(n * n_samples,)
         # normalize rewards per group
-        rewards = torch.stack(torch.split(raw_rewards, n_samples))  # shape=(n, n_samples)
+        rewards = raw_rewards.reshape(-1, n_samples)  # shape=(n, n_samples)
         group_mean, group_std = rewards.mean(dim=1, keepdim=True), rewards.std(dim=1, keepdim=True)
         rewards = ((rewards - group_mean) / group_std).reshape(-1)  # shape=(n * n_samples,)
         # penalize reward
         valid_mask = self._filter_response(responses)  # shape=(n * n_samples,)
         rewards = torch.where(valid_mask, rewards, self.config['penalty_reward_value'])  # shape=(n * n_samples,)
-        return rewards
+        return rewards, processed
 
     def rejection_sampling(self, responses, rewards, logps, beta=0.1):
         """
@@ -461,28 +461,38 @@ class GRPO(Policy):
         responses, logps = self.generate(prompt, n_samples, return_logp=True)
 
         # second, compute rewards
-        tiled_prompt = prompt.tile((1, n_samples)).reshape(n * n_samples, -1)  # shape=(n * n_samples, prompt_length)
-        rewards = self.compute_rewards(tiled_prompt, responses, n_samples)
+        rewards, processed_response = self.compute_rewards(prompt.tile((1, n_samples)).reshape(n * n_samples, -1),
+                                                           responses, n_samples)
+        logps = logps * (processed_response != self.tokenizer.pad_token_id).int()  # ignore logps on padding token
 
-        responses, rewards, logps = self.rejection_sampling(responses, rewards, logps)
+        # try use post processed response. rather than the generated responses
+        # if we use the processed response to compute a reward score, we don't care log prob after the truncate token.
+        resps, rs, ls = [], [], []
+        for i in range(0, len(responses), n_samples):
+            resp, r, l = self.rejection_sampling(processed_response[i:i+n_samples], rewards[i:i+n_samples], logps[i:i+n_samples])
+            resps.extend(resp)
+            rs.extend(r)
+            ls.extend(l)
+        processed_response, rewards, logps = torch.stack(resps), torch.stack(rs), torch.stack(ls)
 
         # third, compute reference policy's log probs.
         # compute log prob of reference policy
-        # input_ids = torch.cat((tiled_prompt, responses), dim=1)  # do not use post processed responses
-        # logp_ref, _ = self.policy_ref.log_prob(input_ids, prompt_length, avg_seq=False, scale=True)[:,
-        #            prompt_length - 1:]  # shape=(n * n_samples, response_length)
+        n_select = self.config['n_samples_select']
+        input_ids = torch.cat((prompt.tile((1, n_select)).reshape(n * n_select, -1), processed_response), dim=1)
+        logp_ref, _ = self.policy_ref.log_prob(input_ids, prompt_length, avg_seq=False, scale=True,
+                                               top_p=self.config['top_p'])  # shape=(n * n_select, response_length)
 
         return {
-            'responses': responses,  # shape=(n * n_samples, response_length)
-            'rewards': rewards.unsqueeze(1),  # shape=(n * n_samples, 1)
-            'logp': logps,  # current iteration policy log probs. shape=(n * n_samples, response_length)
-          #  'logp_ref': logp_ref  # reference policy log probs. shape=(n * n_samples, response_length)
+            'responses': processed_response,  # shape=(n * n_select, response_length)
+            'rewards': rewards.unsqueeze(1),  # shape=(n * n_select, 1)
+            'logp': logps,  # current iteration policy log probs. shape=(n * n_select, response_length)
+            'logp_ref': logp_ref  # reference policy log probs. shape=(n * n_select, response_length)
         }
 
-    def compute_loss(self, prompts, responses, rewards, old_logps, prompt_length):
-        with torch.no_grad():
-            logp_ref, _ = self.policy_ref.log_prob(torch.cat((prompts, responses), dim=1), prompt_length,
-                                        avg_seq=False, scale=True, top_p=self.config['top_p'])
+    def compute_loss(self, prompts, responses, rewards, old_logps, logp_ref, prompt_length):
+        # with torch.no_grad():
+        #     logp_ref, _ = self.policy_ref.log_prob(torch.cat((prompts, responses), dim=1), prompt_length,
+        #                                 avg_seq=False, scale=True, top_p=self.config['top_p'])
         logp, entropy = self.log_prob(torch.cat((prompts, responses), dim=1), prompt_length,
                                       avg_seq=False, scale=True, return_entropy=True, top_p=self.config['top_p'])
 
@@ -494,7 +504,7 @@ class GRPO(Policy):
         pg_gain_clipped = rewards * torch.clamp(ratio, 1.0 - self.config['cliprange'], 1.0 + self.config['cliprange'])
         pg_gain_min = torch.minimum(pg_gain, pg_gain_clipped)  # true whether reward is positive or negative
         kl = self.kl_divergence(logp, logp_ref)
-        loss = torch.sum(self.config['kl_coef'] * kl - pg_gain_min)
+        loss = torch.mean(self.config['kl_coef'] * kl - pg_gain_min)
         return (loss,
                 {'grpo/kl_penalty': torch.mean(kl),
                  'grpo/entropy': torch.mean(entropy),
@@ -504,4 +514,16 @@ class GRPO(Policy):
                  'grpo/ratio_max': ratio.max(),
                  'grpo/ratio_min': ratio.min(),
                  })
+
+    @torch.no_grad()
+    def eval_accuracy(self, input_ids, prompt_length):
+        logp_ref, _ = self.policy_ref.log_prob(input_ids, prompt_length)
+        logp, _ = self.log_prob(input_ids, prompt_length)
+
+        loss, reward_w, reward_l = self.compute_loss_reward(logp, logp_ref)
+        return loss, {
+            f"reward/{self.config['model_for']}_eval_chosen": reward_w.mean(),
+            f"reward/{self.config['model_for']}_eval_rejected": reward_l.mean(),
+            f"reward/{self.config['model_for']}_eval_acc": (reward_w > reward_l).float().mean()
+        }
 

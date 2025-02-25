@@ -3,12 +3,12 @@ model_for: grpo
 model: gpt2
 dtype: bfloat16
 
-ckpt: saved_ckpt/sft_gpt2_fsdp_1740081604_position.pt
+ckpt: saved_ckpt/sft_gpt2_fsdp_900_1740418880_length.pt
 ckpt_type: sft
 
 batch_size: 256
-gradient_step: 128
-lr: 0.00001
+gradient_step: 16
+lr: 0.000005
 min_lr: 0.000001
 epoch: 3
 
@@ -18,16 +18,22 @@ n_samples_select: 8
 temperature: 0.7
 top_p: 1.0
 
-max_response_length: 64
+max_prompt_length: 384
+max_response_length: 56
+
 #noptepochs: 2  # number of ppo iterations
 penalty_reward_value: -1  # if a sampling response has no end token, set its reward to this value
 beta: 0.1
+label_smoothing: 0.0
 
 cliprange: 0.2
 kl_coef: 0.03
 
-normalize_sample: 512
+normalize_sample: 1024
 normalize_batch_size: 64
+
+eval_sample: 1024
+eval_batch_size: 64
 
 activation_checkpointing: True
 
@@ -40,10 +46,10 @@ save_using_num_threads: 4
 
 policy_ref:
   model: gpt2
-  ckpt: saved_ckpt/sft_gpt2_fsdp_1740081604_position.pt
+  ckpt: saved_ckpt/sft_gpt2_fsdp_900_1740418880_length.pt
   ckpt_type: sft
 
 reward_model:
   model: gpt2-large
-  ckpt: saved_ckpt/reward_gpt2-large_fsdp_1740189565_lr0.0000005.pt
+  ckpt: saved_ckpt/reward_gpt2-large_fsdp_1100_1740431466_length.pt
   ckpt_type: reward
