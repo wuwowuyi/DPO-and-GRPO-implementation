@@ -132,8 +132,8 @@ def train(config: dict):
             prompts = prompts.to(device, dtype=torch.int32)
 
             rollouts = defaultdict(list)
-            for p in prompts:
-                for k, v in model.generate_rollouts(p).items():
+            for i in range(0, len(prompts), config['rollout_batch_size']):
+                for k, v in model.generate_rollouts(prompts[i:i+config['rollout_batch_size']]).items():
                     rollouts[k].extend(v)
 
             for k, v in rollouts.items():

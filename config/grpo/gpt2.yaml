@@ -14,6 +14,7 @@ epoch: 3
 
 n_samples: 64
 n_samples_select: 8
+rollout_batch_size: 2  # fit gpu size
 
 temperature: 0.7
 top_p: 1.0
@@ -29,7 +30,7 @@ label_smoothing: 0.0
 cliprange: 0.2
 kl_coef: 0.03
 
-normalize_sample: 1024
+normalize_sample: 1536
 normalize_batch_size: 64
 
 eval_sample: 1024
@@ -50,6 +51,6 @@ policy_ref:
   ckpt_type: sft
 
 reward_model:
-  model: gpt2-large
-  ckpt: saved_ckpt/reward_gpt2-large_fsdp_1100_1740431466_length.pt
+  model: gpt2
+  ckpt: saved_ckpt/reward_gpt2_fsdp_600_1740464706_length.pt
   ckpt_type: reward
