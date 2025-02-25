@@ -149,7 +149,7 @@ def train(config: dict):
                 # preserve micro-batch metrics
                 losses.append(loss.clone().detach())
                 for mk, mv in metric.items():
-                    metrics[mk].append(mv)
+                    metrics[mk].append(mv.detach())
 
             if config['model_for'] == 'reward':
                 distributed.all_reduce(model.gain.grad, op=distributed.ReduceOp.AVG)
