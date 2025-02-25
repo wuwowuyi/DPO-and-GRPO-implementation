@@ -21,7 +21,7 @@ from transformers import GPT2Tokenizer
 from gpt2 import get_model
 from policy import Policy, Reward, DPO
 from tldr_dataset import TldrCompletion, TldrPreference
-from utils import setup, cleanup, check_fn, fsdp_dict, set_seed, save_model_checkpoint, normalize_reward
+from utils import setup, cleanup, check_fn, fsdp_dict, set_seed, save_model_checkpoint, normalize_reward, fsdp_dict_eval
 
 '''Train models on multiple GPUs using FSDP. '''
 
@@ -55,7 +55,7 @@ def train(config: dict):
         sampling_dataset = TldrCompletion(tokenizer, **dataset_dict)
         dataset = TldrPreference(tokenizer, **dataset_dict)
         # policy is for sampling response to normalize reward
-        policy_ref = Policy(FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, False, device)
+        policy_ref = Policy(FSDP(get_model(config), **fsdp_dict_eval, device_id=device), tokenizer, config, False, device)
         policy_ref.lm_model.eval()
         model = Reward(FSDP(get_model(config), **fsdp_dict, device_id=device), tokenizer, config, trained_reward=False, device=device)
 

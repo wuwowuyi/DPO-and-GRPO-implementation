@@ -2,10 +2,13 @@ model_for: reward
 model: gpt2-large
 dtype: bfloat16
 
-ckpt: saved_ckpt/sft_gpt2-large_fsdp_1740093310_position_last.pt
+ckpt: saved_ckpt/sft_gpt2-large_fsdp_900_1740422475_length.pt
 ckpt_type: sft
 
 temperature: 0.7
+max_prompt_length: 384
+max_response_length: 56
+
 batch_size: 64
 gradient_step: 2  # gradient accumulation steps
 max_gradient: 1  # max gradient norm
@@ -15,8 +18,8 @@ eval_batch_size: 32
 normalize_sample: 1024
 eval_sample: 1024
 
-lr: 0.0000005
-min_lr: 0.0000002
+lr: 0.000005
+min_lr: 0.0000005
 epoch: 1
 
 activation_checkpointing: True
