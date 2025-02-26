@@ -373,7 +373,8 @@ class GRPO(Policy):
         else:
             kl = torch.exp(logp_ref - logp) - (logp_ref - logp) - 1
             #assert kl >= 0, "kl-divergence is non-negative"
-            return kl
+            # some kl are negative though very small, like 0.01.
+            return torch.maximum(kl, torch.zeros_like(kl, device=self.device, dtype=torch.bfloat16))
 
     def _post_process(self, responses):
         """applied to responses before computing a reward.
@@ -476,7 +477,6 @@ class GRPO(Policy):
         processed_response, rewards, logps = torch.stack(resps), torch.stack(rs), torch.stack(ls)
 
         # third, compute reference policy's log probs.
-        # compute log prob of reference policy
         n_select = self.config['n_samples_select']
         input_ids = torch.cat((prompt.tile((1, n_select)).reshape(n * n_select, -1), processed_response), dim=1)
         logp_ref, _ = self.policy_ref.log_prob(input_ids, prompt_length, avg_seq=False, scale=True,
@@ -495,24 +495,24 @@ class GRPO(Policy):
         #                                 avg_seq=False, scale=True, top_p=self.config['top_p'])
         logp, entropy = self.log_prob(torch.cat((prompts, responses), dim=1), prompt_length,
                                       avg_seq=False, scale=True, return_entropy=True, top_p=self.config['top_p'])
-
         ratio = torch.exp(logp - old_logps)
-
-        rewards = rewards.expand_as(ratio)  # expand to (n * n_samples, response_length)
-        #rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+        rewards = rewards.view(-1, 1)
         pg_gain = rewards * ratio
         pg_gain_clipped = rewards * torch.clamp(ratio, 1.0 - self.config['cliprange'], 1.0 + self.config['cliprange'])
         pg_gain_min = torch.minimum(pg_gain, pg_gain_clipped)  # true whether reward is positive or negative
         kl = self.kl_divergence(logp, logp_ref)
-        loss = torch.mean(self.config['kl_coef'] * kl - pg_gain_min)
+        loss = self.config['kl_coef'] * kl - pg_gain_min  # per token loss
+
+        # ignore loss on padding tokens, and no preference for longer responses
+        response_mask = (responses != self.tokenizer.pad_token_id).int()
+        loss = (loss * response_mask).sum() / response_mask.sum()
+
+        clipped = (pg_gain > pg_gain_clipped).float()
+        clipped_frac = (clipped * response_mask).sum() / response_mask.sum()
         return (loss,
                 {'grpo/kl_penalty': torch.mean(kl),
                  'grpo/entropy': torch.mean(entropy),
-                 'grpo/pg_loss': -torch.mean(pg_gain_min),
-                 'grpo/rewards_mean': torch.mean(rewards),
-                 'grpo/rewards_std': torch.std(rewards),
-                 'grpo/ratio_max': ratio.max(),
-                 'grpo/ratio_min': ratio.min(),
+                 'grpo/clip_frac': clipped_frac
                  })
 
     @torch.no_grad()
