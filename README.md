@@ -7,6 +7,75 @@ See [my notes on the papers](https://github.com/wuwowuyi/LLMs-paper-notes).
 
 The implementation tries to be simple, clean and easy to read, from scratch using Pytorch.
 
+## Summary
+
+Summary first.
+
+DPO is easy to implement, and very resource efficient to train.
+
+Compared with DPO, the reward model have better performance in terms of scoring a response. **Reward modeling is critical** for training GRPO policy model.
+
+Even though GRPO does not train a value function model, it is still resource intensive to train. The rollouts generation is very time-consuming, especially when there is only one policy update for each batch.
+
+### Training notes
+#### FSDP
+
+In my experiments, FSDP is a great tool. Using it saved me a lot of pain in fixing the OOM (OutOfMemory) errors. However, it is not that straightforward to use, especially compared with DDP. 
+
+##### Wrapping
+FSDP unit wrapping is central in using FSDP. 
+
+Pytorch provides a number of auto wrap policies, for example `transformer_auto_wrap_policy` for wrapping transformers. But if we make some customizations to the transformer, like using it as a submodule, this wrapping policy won't work.
+
+```python
+class Policy(nn.Module):
+    
+    def __init__(self):
+        super().__init__()
+        self.lm_model = <Some transformer like GPT2>
+        ...
+    
+    def forward(self, input, *args, **kwargs):
+        ....
+```
+The `transformer_auto_wrap_policy` won't work with the `Policy` model defined above.
+I guess in this case we may need to define a custom wrapping policy.
+
+##### Mixed precision and model parameter precision
+
+We know the optimization states take most of the GPU memory, especially for algorithms like Adam, which keeps a copy of parameter, first and second moments of each parameter. FSDP `MixedPrecision` allows to use different data types for different operations like forward, backward, all-reduce, etc., which can save a lot of memory and is very convenient to use. 
+
+Note `MixedPrecision` settings does not affect the precision of sharded parameters which can still be kept in full precision float32. And I found loading a model in bfloat16 slightly hurts training performance.
+
+##### Set `use_orig_params=True` to access original parameters
+
+Model parameters are stored in gigantic flattened 1D tensors by FSDP. 
+If we want to use something like `named_parameters()`, by setting `use_orig_params=True` FSDP exposes a view of the original parameter structure into the flattened parameters, otherwise we get the underlying flattened one.
+
+##### No distributed operations inside `if rank == 0`
+The following code freezes training.
+```python
+if rank == 0:
+    distributed.all_reduce(loss, op=distributed.ReduceOp.AVG)
+```
+For `all_reduce`, `all-gather` or other distributed operations, all ranks must call this operation, not just the master process.
+
+#### Reduce memory footprint
+I spent a lot of time fixing OOM errors.
+
+In addition to gradient accumulation and FSDP activation_checkpointing:
+* If a model is only for interference, use FSDP `CPUOffload(offload_params=True)` can save memory by offloading a model to CPU when it is not used.
+* We usually keep a list of loss values or metrics during gradient accumulation, remember to call `detach()` so that the tensors are detached from computing graph, otherwise garbage collector won't release the memory!
+
+#### GPT2
+##### GPT2 position_ids
+GPT-2 **learns absolute positional embeddings**. It is critical to feed in `position_ids` to model. The reward model didn't train until `position_ids` is provided.
+However, when using transformer's `generate` method, providing `position_ids` fails text generation completely.
+
+##### Padding side
+Typically prompt is padded on the left, and response on the right, so that they can be concatenated. There should be no padding tokens in the middle otherwise it won't work.
+For the reward model, since the score is computed on the entire prompt + response, moving all the padding tokens to the left can increase performance for GPT2, related to GPT2's absolute positional embeddings.
+
 ## Setup
 
 Training generally follows OpenAI's RLHF papers, using Pytorch FSDP.
@@ -79,8 +148,9 @@ See the [DPO(gpt2-large) wandb training logs](https://wandb.ai/dalucheng/dpo_grp
 
 <img src="assets/reward_gpt2-large_training.png" alt="reward gpt2-large training plot" width="600"/>
 
-See [the Reward model(gpt2-large) wandb training logs](https://wandb.ai/dalucheng/dpo_grpo_rs/runs/1ti4b6th) here.
+Similar to DPO, as training goes, we can see the gap increases between chosen completion reward and rejected completion reward.
 
+See [the Reward model(gpt2-large) wandb training logs](https://wandb.ai/dalucheng/dpo_grpo_rs/runs/1ti4b6th) here.
 
 ### Evaluation result
 
@@ -94,8 +164,7 @@ For reward, $r$ is simply the output reward value.
 | gpt2 small          | 0.61 | 0.62         | 0.58        |
 | gpt2 large          | 0.62 | 0.66         | n/a         |
 
-The GRPO policy is guided by a reward model of the same size. 
+The GRPO policy is guided by a reward model of the same size.
 
-We can see **reward modeling is critical** for GRPO policy model.
-
+ 
 
