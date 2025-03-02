@@ -186,7 +186,7 @@ class Policy(LLM):
 
         logps = None
         if return_logp:
-            logits = torch.stack(outputs.logits)  # shape=(response_length, n * n_samples, vocab_size)
+            logits = torch.stack(outputs.logits).to(dtype=torch.bfloat16)  # shape=(response_length, n * n_samples, vocab_size)
             logits = logits.transpose(0, 1)  # shape=(n * n_samples, response_length, vocab_size)
             logits /= torch.as_tensor(self.config['temperature'], dtype=torch.bfloat16, device=self.device)
             if extra_params['top_k'] > 0:
@@ -407,13 +407,13 @@ class GRPO(Policy):
         # normalize rewards per group
         rewards = raw_rewards.reshape(-1, n_samples)  # shape=(n, n_samples)
         group_mean, group_std = rewards.mean(dim=1, keepdim=True), rewards.std(dim=1, keepdim=True)
-        rewards = ((rewards - group_mean) / group_std).reshape(-1)  # shape=(n * n_samples,)
+        rewards = ((rewards - group_mean) / (group_std + 1e-8)).reshape(-1)  # shape=(n * n_samples,)
         # penalize reward
         valid_mask = self._filter_response(responses)  # shape=(n * n_samples,)
         rewards = torch.where(valid_mask, rewards, self.config['penalty_reward_value'])  # shape=(n * n_samples,)
         return rewards, processed
 
-    def rejection_sampling(self, responses, rewards, logps, beta=0.1):
+    def rejection_sampling(self, responses, rewards, logps):
         """
         Algorithm 1 (conduct_rejection_sampling function) from paper https://arxiv.org/abs/2309.06657.
 
@@ -431,7 +431,7 @@ class GRPO(Policy):
             to_remove = []
             for c, (r, logp) in candidates.items():
                 u = torch.rand(1, dtype=torch.bfloat16, device=self.device)
-                if u >= torch.exp((r - max_reward) / beta):  # todo: range of right side value?
+                if u >= torch.exp((r - max_reward) / self.config['gamma']):  # todo: range of right side value?
                     continue
                 accepted.append((c, r, logp))
                 to_remove.append(c)
@@ -440,6 +440,21 @@ class GRPO(Policy):
             for c in to_remove:
                 candidates.pop(c)
 
+        return (torch.stack([t[0] for t in accepted]),
+                torch.stack([t[1] for t in accepted]),
+                torch.stack([t[2] for t in accepted]),
+                )
+
+    def pick_n(self, responses, rewards, logps):
+        """
+        Select responses with highest and lowest n responses.
+        """
+        candidates = [(c, r, logp) for c, r, logp in
+                      zip(torch.unbind(responses), torch.unbind(rewards), torch.unbind(logps))]
+        candidates.sort(key=itemgetter(1))
+        n = self.config['n_samples_select'] // 2
+        accepted = candidates[:n]  # response with lowest n reward
+        accepted.extend(candidates[-n:])  # response with highest n reward
         return (torch.stack([t[0] for t in accepted]),
                 torch.stack([t[1] for t in accepted]),
                 torch.stack([t[2] for t in accepted]),
@@ -495,23 +510,24 @@ class GRPO(Policy):
         #                                 avg_seq=False, scale=True, top_p=self.config['top_p'])
         logp, entropy = self.log_prob(torch.cat((prompts, responses), dim=1), prompt_length,
                                       avg_seq=False, scale=True, return_entropy=True, top_p=self.config['top_p'])
+        # logp and old_logps are different even though there is only one policy step. due to FSDP
         ratio = torch.exp(logp - old_logps)
-        rewards = rewards.view(-1, 1)
         pg_gain = rewards * ratio
         pg_gain_clipped = rewards * torch.clamp(ratio, 1.0 - self.config['cliprange'], 1.0 + self.config['cliprange'])
         pg_gain_min = torch.minimum(pg_gain, pg_gain_clipped)  # true whether reward is positive or negative
         kl = self.kl_divergence(logp, logp_ref)
-        loss = self.config['kl_coef'] * kl - pg_gain_min  # per token loss
+        loss = self.config['kl_coef'] * kl - pg_gain_min  # shape=(n, response_length)
 
         # ignore loss on padding tokens, and no preference for longer responses
         response_mask = (responses != self.tokenizer.pad_token_id).int()
-        loss = (loss * response_mask).sum() / response_mask.sum()
+        n_tokens = response_mask.sum()
+        loss = (loss * response_mask).sum() / n_tokens  # per token loss
 
         clipped = (pg_gain > pg_gain_clipped).float()
-        clipped_frac = (clipped * response_mask).sum() / response_mask.sum()
+        clipped_frac = (clipped * response_mask).sum() / n_tokens
         return (loss,
-                {'grpo/kl_penalty': torch.mean(kl),
-                 'grpo/entropy': torch.mean(entropy),
+                {'grpo/kl_penalty': kl.sum() / n_tokens,
+                 'grpo/entropy': entropy.sum() / n_tokens,
                  'grpo/clip_frac': clipped_frac
                  })
 

@@ -142,7 +142,7 @@ def train(config: dict):
             # normalize rewards
             r_mean, r_std = rollouts['rewards'].mean(), rollouts['rewards'].std()
             rollouts['rewards'] -= r_mean
-            rollouts['rewards'] /= r_std
+            rollouts['rewards'] /= r_std + 1e-8
 
             # gradient accumulation steps
             micro_batch_size = local_batch_size * config['n_samples_select'] // config['gradient_step']
