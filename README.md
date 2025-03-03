@@ -1,6 +1,6 @@
 # DPO and GRPO
 My replication of two RLHF algorithms:
-* DPO [Direct Preference Optimization: Your Language Model is Secretly a Reward Model](https://arxiv.org/abs/2305.18290) In my view, very similar to how an offline RL algorithm like [AWAC](https://arxiv.org/abs/2006.09359) to learn a policy. 
+* DPO [Direct Preference Optimization: Your Language Model is Secretly a Reward Model](https://arxiv.org/abs/2305.18290) In my view, this algorithm is very similar to how an offline RL algorithm like [AWAC](https://arxiv.org/abs/2006.09359) to learn a policy. 
 * GRPO (Group Relative Policy Optimization), introduced in [DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models](https://arxiv.org/abs/2402.03300), and is a variant of PPO ([Proximal Policy Optimization](https://arxiv.org/abs/1707.06347)).
 
 See [my notes on the papers](https://github.com/wuwowuyi/LLMs-paper-notes).
@@ -13,11 +13,11 @@ Summary first.
 
 DPO is easy to implement, and very resource efficient to train.
 
-Compared with DPO, the reward model has better performance in terms of scoring a response. And **reward modeling is critical** for training the policy model. In my experiments, the GRPO policy can get an evaluation accuracy close to the reward model but not stable, perhaps because the rewarding scores are very noisy.
+Compared with DPO, the reward model has better performance in terms of scoring a response. And **reward modeling is critical** for training the policy model. In my experiments, the GRPO policy can get an evaluation accuracy close to the reward model but unstable. Perhaps because the reward model is noisy and sampling variance is too high.
 
 Even though GRPO does not train a value function model $V(s)$, it is still very resource intensive especially when there is only one policy update for each batch (DeepSeek default setting). Without a value function we need a much larger batch size to reduce variance, which greatly increase the rollouts generation and gradient computation time.
 
-:thinking Maybe combing DPO and a reward model is a viable in some cases? like we can generate samples from the DPO policy, label them by the reward model to generate pairs and then train DPO policy? Reasons:
+🤔 Maybe combing DPO and a reward model is doable in some cases? like we can generate samples from the DPO policy, label them by the reward model to generate pairs and then train DPO policy? Reasons:
 * reward model is better in scoring a sample
 * no distributional shift since samples are from the policy itself
 * resource efficient
@@ -29,10 +29,10 @@ We should also perform the training iteratively to avoid distributional shift.
 
 FSDP spares me a lot of pain in dealing with the OOM (OutOfMemory) errors. However, it is not that straightforward to use, especially compared with DDP. 
 
-##### Wrapping
+##### FSDP Wrapping
 FSDP unit wrapping is central in using FSDP. 
 
-PyTorch offers several auto-wrap policies, such as transformer_auto_wrap_policy for wrapping transformers. However, if we customize the transformer, such as using it as a submodule, this wrapping policy will not work.
+PyTorch offers several auto-wrap policies, such as `transformer_auto_wrap_policy` for wrapping transformers. However, if we customize the transformer, such as using it as a submodule, this wrapping policy will not work.
 
 ```python
 class Policy(nn.Module):
@@ -48,7 +48,7 @@ class Policy(nn.Module):
 The `transformer_auto_wrap_policy` won't work with the `Policy` model defined above.
 I guess in this case we need to define a custom wrapping policy.
 
-##### Mixed precision and model parameter precision
+##### FSDP Mixed precision and model parameter precision
 
 We know the optimization states take most of the GPU memory, especially for algorithms like Adam, which keeps a copy of parameter, and first and second moments. FSDP `MixedPrecision` allows to use different data types for different operations like forward, backward, all-reduce, etc., which can save a lot of memory and is very convenient to use. 
 
@@ -59,7 +59,7 @@ Note `MixedPrecision` settings do not affect the precision of sharded parameters
 Model parameters are stored in gigantic flattened 1D tensors by FSDP. 
 If we want to use something like `named_parameters()`, by setting `use_orig_params=True` FSDP exposes a view of the original parameter structure into the flattened parameters.
 
-##### No distributed operations inside `if rank == 0`
+#### No distributed operations inside `if rank == 0`
 The following code freezes training.
 ```python
 if rank == 0:
@@ -103,7 +103,7 @@ The pretrained base model is loaded from Hugging face.
 #### DPO
 DPO model training is shown as below.
 
-<img src="assets/dpo.jpg" alt="dpo training pipeline" width="800"/>
+<img src="assets/dpo.jpg" alt="dpo training pipeline" width="550"/>
 
 Note I didn't do SFT on tldr preference as the [DPO paper implementation](https://github.com/eric-mitchell/direct-preference-optimization) does, since it increases the probability of chosen completions, which feels like a data leakage.
 
@@ -115,10 +115,10 @@ GRPO training pipeline is depicted below.
 SFT is the same as DPO. And a reward model is trained on Tldr preference dataset.
 
 GRPO is a variant of PPO. In my view, it primarily makes two changes:
-* uses a sample group mean to approximate baseline to obviate the need for a value function model. 
-* changes how per-token KL penalty is computed. 
+* uses a sample group mean to approximate a value baseline to obviate the need for a value function model. 
+* changes how per-token KL penalty is calculated. 
 
-In addition to these two changes, I found the follow tricks can help improve performance:
+In my experiments, I found the follow tricks can help improve performance:
 * **high temperature rejection sampling**: In the GRPO paper, the batch size is 1024, and each prompt has 64 responses, which means 1024 * 64 samples in one single batch, which takes too long to process on my machine. What I did is that, after generating a group of responses to a prompt, [statistical rejection sampling](https://arxiv.org/abs/2309.06657) is used in order to reduce the total sample size. I only use a batch size of 256, and then rejection sample 8 out of 64 generated responses, which means 256 * 8 samples in one batch. A higher temperature > 1 (beta in the paper), like 2, works well. I see this value trades off exploitation and exploration. 
 * **ignore loss on tokens after the truncate token**: PPO computes the reward on a post-processed response where all tokens after the truncate token are masked out. However, it still computes the policy loss on the unprocessed responses. Here I compute loss on the post-processed responses because it does not make sense to consider the loss on tokens after the truncate token, especially given how the reward score is calculated.
 * **global normalization**. In addition to group normalization, normalizing advantages across all samples in a batch is beneficial.
@@ -159,7 +159,7 @@ See [the Reward model(gpt2-large) wandb training logs](https://wandb.ai/daluchen
 
 <img src="assets/grpo_gpt2-small_training.png" alt="grpo gpt2-small training plot" width="600"/>
 
-In the plot above, we can see the evaluation accuracy increases rapidly, but then goes down. I suspect it is because the reward model is noisy, and variance is still too big.
+In the plot above, we can see GRPO evaluation accuracy increases rapidly, but then goes down. I suspect it is because the reward model is noisy, and variance is still too high.
 
 ### Evaluation result
 
@@ -173,6 +173,6 @@ For reward, $r$ is simply the output reward value.
 | gpt2 small (124M)   | 0.61 | 0.62         | 0.59        |
 | gpt2 large (774M)   | 0.62 | 0.66         | n/a         |
 
-The GRPO policy is guided by a reward model of the same size. Ideally we can use a larger reward model to guide policy, but in my environment it takes too long to train.
+The GRPO policy is guided by a reward model of the same size. Ideally we can use a larger reward model to guide policy, but in my environment it took too long to train.
 
 
