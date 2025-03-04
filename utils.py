@@ -63,6 +63,9 @@ def set_seed(seed: int, rank: int):
 def move_padding_left(tokens, pad_token_id):
     """
     Move all padding tokens to the left.
+
+    Learned from Costa Huang's implementation at:
+     https://github.com/vwxyzjn/lm-human-preference-details/blob/main/lm_human_preference_details/train_reward_accelerate.py
     """
     return torch.tensor(
         [[pad_token_id] * (t == pad_token_id).sum() + [x for x in t if x != pad_token_id] for t in tokens],
